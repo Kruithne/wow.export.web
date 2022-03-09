@@ -1,0 +1,20 @@
+@font-face {
+	font-family: 'Selawik';
+	src: local('Segoe UI Regular'), url('./selawk.woff2') format('woff2');
+}
+
+
+@font-face {
+	font-family: 'Selawik';
+	font-weight: bold;
+	src: local('Segoe UI Bold'), url('./selawkb.woff2') format('woff2');
+}
+
+* {
+	padding: 0;
+	margin: 0;
+}
+
+body {
+	font-family: 'Selawik', sans-serif;
+}
