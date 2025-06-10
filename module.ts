@@ -11,7 +11,7 @@ type SpooderServer = ReturnType<typeof serve>;
 
 const ANSI_RESET = '\x1b[0m';
 function log(message: string, color: ColorInput = 'orange'): void {
-	const ansi = Bun.color(color, 'ansi');
+	const ansi = Bun.color(color, 'ansi-256');
 	process.stdout.write(`[{wow.export}] > ${message}\n`.replace(/\{([^}]+)\}/g, `${ansi}$1${ANSI_RESET}`));
 }
 
