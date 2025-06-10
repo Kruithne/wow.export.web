@@ -1,18 +1,29 @@
 import { serve } from 'spooder';
-import path from 'node:path';
+import crypto from 'node:crypto';
 
 type SpooderServer = ReturnType<typeof serve>;
 
+let index: string|null = null;
+let index_hash: string|null = null;
+
 export function init(server: SpooderServer) {
-	server.dir('/wow.export', './wow.export/public', async (file_path, file, stat, _request) => {
-		// ignore hidden files
-		if (path.basename(file_path).startsWith('.'))
-			return 404; // Not Found
+	server.route('/wow.export', async (req) => {
+		if (index === null) {
+			index = await Bun.file('./wow.export/index.html').text();
+			index_hash = crypto.createHash('sha256').update(index).digest('hex');
+		}
 		
-		// ignore directories
-		if (stat.isDirectory())
-			return 401; // Unauthorized
+		const headers = {
+			'Content-Type': 'text/html',
+			'Access-Control-Allow-Origin':  '*',
+			'ETag': index_hash as string
+		} as Record<string, string>;
 		
-		return file;
+		if (req.headers.get('If-None-Match') === index_hash)
+			return new Response(null, { status: 304, headers }); // Not Modified
+		
+		return new Response(index, { status: 200, headers });
 	});
+
+	server.dir('/wow.export/static', './wow.export/static');
 }
