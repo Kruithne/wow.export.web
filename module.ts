@@ -3,14 +3,23 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { ColorInput } from 'bun';
 
 const UPDATE_TIMER = 24 * 60 * 60 * 1000; // 24 hours
 
 type SpooderServer = ReturnType<typeof serve>;
 
+const ANSI_RESET = '\x1b[0m';
+function log(message: string, color: ColorInput = 'orange'): void {
+	const ansi = Bun.color(color, 'ansi');
+	process.stdout.write(`[{wow.export}] > ${message}\n`.replace(/\{([^}]+)\}/g, `${ansi}$1${ANSI_RESET}`));
+}
+
 async function download_and_store(url: string, target_dir: string, target_filename: string, name: string) {
 	const target_file = path.join(target_dir, target_filename);
 	let temp_file: string | null = null;
+
+	log(`downloading {${name}} from {${url}} to {${target_file}}`);
 	
 	try {
 		const response = await fetch(url);
@@ -22,6 +31,8 @@ async function download_and_store(url: string, target_dir: string, target_filena
 		await Bun.write(temp_file, response);
 		await fs.mkdir(target_dir, { recursive: true });
 		await fs.rename(temp_file, target_file);
+
+		log(`successfully updated {${name}} to {${target_file}}`);
 
 		temp_file = null;
 	} catch (error) {
