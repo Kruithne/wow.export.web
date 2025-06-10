@@ -40,7 +40,7 @@ async function update_data_files() {
 }
 
 async function update_listfile() {
-	const url = 'https://raw.githubusercontent.com/wowdev/wow-listfile/master/community-listfile.csv';
+	const url = 'https://github.com/wowdev/wow-listfile/releases/latest/download/community-listfile.csv';
 	const target_dir = './wow.export/data/listfile';
 	
 	await download_and_store(url, target_dir, 'master', 'listfile');
