@@ -1,0 +1,3 @@
+# this directory contains binary data such as download archives, update pack files, listfile/tact keys, etc.
+*
+!.gitignore
