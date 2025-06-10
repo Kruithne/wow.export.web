@@ -1,0 +1,3 @@
+# this directory contains the update manifest/pack file
+*
+!.gitignore
