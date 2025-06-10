@@ -26,7 +26,6 @@ async function download_and_store(url: string, target_dir: string, target_filena
 		temp_file = null;
 	} catch (error) {
 		caution(`Failed to update ${name}`, [error instanceof Error ? error.message : String(error)]);
-		throw error;
 	} finally {
 		if (temp_file)
 			await fs.unlink(temp_file);
