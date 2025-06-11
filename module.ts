@@ -28,7 +28,42 @@ async function download_and_store(url: string, target_dir: string, target_filena
 		
 		temp_file = path.join(os.tmpdir(), `${name}_${crypto.randomUUID()}.tmp`);
 		
-		await Bun.write(temp_file, response);
+		const content_length = response.headers.get('content-length');
+		const total_size = content_length ? parseInt(content_length, 10) : null;
+		
+		if (total_size && response.body) {
+			const reader = response.body.getReader();
+			const file_handle = Bun.file(temp_file);
+			const writer = file_handle.writer();
+			
+			let downloaded_bytes = 0;
+			let last_logged_percent = -1;
+			
+			try {
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done)
+						break;
+					
+					writer.write(value);
+					downloaded_bytes += value.length;
+					
+					const percent = Math.floor((downloaded_bytes / total_size) * 100);
+					if (percent >= last_logged_percent + 10 && percent <= 100) {
+						const downloaded_mb = (downloaded_bytes / (1024 * 1024)).toFixed(1);
+						const total_mb = (total_size / (1024 * 1024)).toFixed(1);
+						log(`downloading {${name}}: ${percent}% (${downloaded_mb} MB / ${total_mb} MB)`);
+						last_logged_percent = percent;
+					}
+				}
+			} finally {
+				await writer.end();
+				reader.releaseLock();
+			}
+		} else {
+			await Bun.write(temp_file, response);
+		}
+		
 		await fs.mkdir(target_dir, { recursive: true });
 		await fs.rename(temp_file, target_file);
 
