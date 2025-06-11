@@ -82,6 +82,10 @@ async function update_data_files() {
 	await update_listfile();
 	await update_tact();
 
+	schedule_update();
+}
+
+function schedule_update() {
 	setTimeout(update_data_files, UPDATE_TIMER);
 }
 
@@ -137,5 +141,5 @@ export function init(server: SpooderServer) {
 	server.dir('/wow.export/static', './wow.export/static');
 	server.dir('/wow.export/update', './wow.export/update');
 
-	update_data_files();
+	schedule_update();
 }
