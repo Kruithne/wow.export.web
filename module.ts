@@ -140,6 +140,7 @@ export function init(server: SpooderServer) {
 	server.dir('/wow.export/data', './wow.export/data');
 	server.dir('/wow.export/static', './wow.export/static');
 	server.dir('/wow.export/update', './wow.export/update');
+	server.dir('/wow.export/download', './wow.export/download');
 
 	schedule_update();
 }
