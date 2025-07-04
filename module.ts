@@ -132,8 +132,7 @@ export function init(server: SpooderServer) {
 
 		const dbd = await fetch(`https://raw.githubusercontent.com/wowdev/WoWDBDefs/master/definitions/${def}.dbd`);
 		return new Response(dbd.body, {
-			status: dbd.status,
-			headers: dbd.headers 
+			status: dbd.status
 		});
 	});
 
