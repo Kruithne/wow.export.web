@@ -251,7 +251,7 @@ export function init(server: SpooderServer) {
 		setImmediate(process_queue);
 
 		return 202; // Accepted
-	}));
+	}), 'POST');
 
 	server.dir('/wow.export/data', './wow.export/data');
 	server.dir('/wow.export/static', './wow.export/static');
