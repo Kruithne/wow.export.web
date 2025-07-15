@@ -167,7 +167,7 @@ async function process_queue() {
 		return;
 
 	is_processing_update = true;
-	log(`processing update queue (${update_queue.length} requests pending)`);
+	log(`processing update queue ({${update_queue.length}} requests pending)`);
 
 	while (update_queue.length > 0) {
 		const request = update_queue.shift()!;
