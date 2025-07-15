@@ -214,6 +214,17 @@ export function init(server: SpooderServer) {
 		});
 	});
 
+	server.dir('/wow.export/data', './wow.export/data');
+	server.dir('/wow.export/static', './wow.export/static');
+	server.dir('/wow.export/update', './wow.export/update');
+	server.dir('/wow.export/download', './wow.export/download');
+
+	schedule_update();
+
+
+	// v2
+	server.dir('/wow.export/v2/update', './wow.export/v2/update');
+
 	server.route('/wow.export/v2/trigger_update/:key', validate_req_json(async (req, url, json) => {
 		const key = url.searchParams.get('key');
 		const expected_key = process.env.WOW_EXPORT_V2_UPDATE_KEY;
@@ -252,11 +263,4 @@ export function init(server: SpooderServer) {
 
 		return 202; // Accepted
 	}), 'POST');
-
-	server.dir('/wow.export/data', './wow.export/data');
-	server.dir('/wow.export/static', './wow.export/static');
-	server.dir('/wow.export/update', './wow.export/update');
-	server.dir('/wow.export/download', './wow.export/download');
-
-	schedule_update();
 }
