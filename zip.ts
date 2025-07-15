@@ -8,6 +8,14 @@ const LOCSIG = 0x04034b50; // "PK\003\004"
 const STORED = 0; // no compression
 const DEFLATED = 8; // deflate compression
 
+const crc_table = new Uint32Array(256);
+for (let i = 0; i < 256; i++) {
+	let crc = i;
+	for (let j = 0; j < 8; j++)
+		crc = (crc & 1) ? (0xedb88320 ^ (crc >>> 1)) : (crc >>> 1);
+	crc_table[i] = crc;
+}
+
 interface ZipEntry {
 	entry_name: string;
 	is_directory: boolean;
@@ -107,20 +115,10 @@ function calculate_file_data_offset(buffer: Uint8Array, entry: ZipEntry): number
 }
 
 function crc32(data: Uint8Array): number {
-	const crc_table = new Uint32Array(256);
-	for (let i = 0; i < 256; i++) {
-		let crc = i;
-		for (let j = 0; j < 8; j++)
-			crc = (crc & 1) ? (0xedb88320 ^ (crc >>> 1)) : (crc >>> 1);
-
-		crc_table[i] = crc;
-	}
-	
-	let crc = 0xffffffff;
+	let crc = ~0;
 	for (let i = 0; i < data.length; i++)
 		crc = crc_table[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
-
-	return (crc ^ 0xffffffff) >>> 0;
+	return ~crc >>> 0;
 }
 
 function decompress_data(compressed_data: Uint8Array, method: number, expected_size: number): Uint8Array {
