@@ -34,7 +34,7 @@ interface EndOfCentralDirectory {
 }
 
 function read_uint32_le(buffer: Uint8Array, offset: number): number {
-	return buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16) | (buffer[offset + 3] << 24);
+	return (buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16) | (buffer[offset + 3] << 24)) >>> 0;
 }
 
 function read_uint16_le(buffer: Uint8Array, offset: number): number {
