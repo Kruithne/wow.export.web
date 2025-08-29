@@ -117,6 +117,71 @@ interface UpdateRequest {
 let update_queue: UpdateRequest[] = [];
 let is_processing_update = false;
 
+interface UploadSession {
+	build: string;
+	m_size: number;
+	c_size: number;
+	t_size: number;
+	temp_file: string;
+	bytes_written: number;
+	file_handle: any;
+}
+
+let is_uploading = false;
+let current_upload: UploadSession | null = null;
+
+async function cleanup_upload_session() {
+	if (current_upload) {
+		try {
+			if (current_upload.file_handle)
+				await current_upload.file_handle.end();
+
+			await fs.unlink(current_upload.temp_file);
+		} catch (error) {
+			// ignore
+		}
+
+		current_upload = null;
+	}
+	is_uploading = false;
+}
+
+async function process_websocket_upload(ws: any) {
+	if (!current_upload) {
+		ws.close(1011, 'No upload session');
+		return;
+	}
+
+	const { build, c_size, temp_file } = current_upload;
+
+	try {
+		const update_path = path.join('./wow.export/update', build);
+		const bundle = Bun.file(temp_file);
+
+		const manifest_data = bundle.slice(c_size);
+		const manifest = await manifest_data.json(); // validates JSON parses
+		
+		const tmp_path_content = path.join(os.tmpdir(), 'wow_export_content_tmp');
+		await Bun.write(tmp_path_content, bundle.slice(0, c_size));
+
+		await fs.mkdir(update_path, { recursive: true });
+
+		await Bun.write(path.join(update_path, 'update.json'), manifest_data);
+
+		const proc = Bun.spawn(['mv', tmp_path_content, path.join(update_path, 'update')]);
+		await proc.exited;
+
+		log(`websocket upload completed successfully for build {${build}}`);
+		ws.close(1000, 'Upload complete');
+		await cleanup_upload_session();
+	} catch (error) {
+		const errorMsg = error instanceof Error ? error.message : String(error);
+		log(`websocket upload processing failed: ${errorMsg}`);
+		ws.close(1011, 'Processing failed');
+		await cleanup_upload_session();
+	}
+}
+
 async function process_update_request(request: UpdateRequest) {
 	const { manifest, update_package, build_id } = request;
 	
@@ -222,55 +287,101 @@ export function init(server: SpooderServer) {
 
 	schedule_update();
 
-	server.route('/wow.export/v2/trigger_update/:build/:msize/:csize', async (req, url) => {
-		const key = req.headers.get('authorization');
-		const expected_key = process.env.WOW_EXPORT_V2_UPDATE_KEY;
+	server.websocket('/wow.export/v2/trigger_update/:build/:msize/:csize', {
+		accept(req) {
+			const url = new URL(req.url);
 
-		if (!expected_key || key !== expected_key)
-			return 401; // Unauthorized.
+			if (is_uploading)
+				return false;
 
-		const m_size = Number(url.searchParams.get('msize'));
-		const c_size = Number(url.searchParams.get('csize'));
-		
-		if (isNaN(m_size) || m_size >= 0 || isNaN(c_size) || c_size >= 0)
-			return 400; // Bad Request
+			const key = req.headers.get('authorization');
+			const expected_key = process.env.WOW_EXPORT_V2_UPDATE_KEY;
+			if (!expected_key || key !== expected_key)
+				return false;
 
-		const t_size = m_size + c_size;
-		if (t_size >= MAX_UPDATE_SIZE)
-			return 413; // Payload Too Large
+			const build = url.searchParams.get('build');
+			const m_size = Number(url.searchParams.get('msize'));
+			const c_size = Number(url.searchParams.get('csize'));
 
-		const build = url.searchParams.get('build');
-		if (build === null)
-			return 400; // Bad Request
+			if (!build || isNaN(m_size) || m_size <= 0 || isNaN(c_size) || c_size <= 0)
+				return false;
 
-		const update_path = path.join('./wow.export/update', build);
-		const tmp_path = path.join(os.tmpdir(), 'wow_export_tmp');
+			const t_size = m_size + c_size;
+			if (t_size >= MAX_UPDATE_SIZE)
+				return false;
 
-		const stream = new Response(req.body);
-		await Bun.write(tmp_path, stream);
+			return { build, m_size, c_size, t_size };
+		},
 
-		const bundle = Bun.file(tmp_path);
+		async open(ws) {
+			try {
+				 // @ts-ignore
+				const { build, m_size, c_size, t_size } = ws.data;
 
-		try {
-			if (bundle.size !== t_size)
-				throw new Error('Uploaded data does not match provided sizes');
+				is_uploading = true;
 
-			const manifest = bundle.slice(c_size);
-			await manifest.json(); // validates JSON parses
+				const temp_file = path.join(os.tmpdir(), `wow_export_upload_${crypto.randomUUID()}.tmp`);
+				const file_handle = Bun.file(temp_file).writer();
 
-			const tmp_path_content = path.join(os.tmpdir(), 'wow_export_content_tmp');
-			await Bun.write(tmp_path_content, bundle.slice(0, c_size));
+				current_upload = {
+					build,
+					m_size,
+					c_size,
+					t_size,
+					temp_file,
+					bytes_written: 0,
+					file_handle
+				};
 
-			await Bun.write(path.join(update_path, 'update.json'), manifest);
+				log(`websocket upload started for build {${build}} (${t_size} bytes expected)`);
+			} catch (error) {
+				log(`failed to initialize upload session: ${error instanceof Error ? error.message : String(error)}`);
+				await cleanup_upload_session();
+				ws.close(1011, 'Failed to initialize upload');
+			}
+		},
 
-			const proc = Bun.spawn(['mv', 'tmp_path_content', path.join(update_path, 'update')]);
-			await proc.exited;
-		} catch (e) {
-			return new Response((e as Error).message, { status: 400 }); // Bad Request
-		} finally {
-			await bundle.delete();
+		async message(ws, message) {
+			if (!current_upload) {
+				ws.close(1002, 'No upload session active');
+				return;
+			}
+
+			try {
+				const chunk = new Uint8Array(message as unknown as ArrayBuffer);
+				const chunk_size = chunk.length;
+
+				if (current_upload.bytes_written + chunk_size > current_upload.t_size) {
+					ws.close(1002, 'Upload exceeds expected size');
+					await cleanup_upload_session();
+					return;
+				}
+
+				current_upload.file_handle.write(chunk);
+				current_upload.bytes_written += chunk_size;
+
+				const mb_written = Math.floor(current_upload.bytes_written / (1024 * 1024));
+				const mb_total = Math.floor(current_upload.t_size / (1024 * 1024));
+				if (mb_written > 0 && current_upload.bytes_written % (10 * 1024 * 1024) < chunk_size)
+					log(`websocket upload progress: ${mb_written} MB / ${mb_total} MB`);
+
+				if (current_upload.bytes_written === current_upload.t_size) {
+					await current_upload.file_handle.end();
+					await process_websocket_upload(ws);
+				}
+			} catch (error) {
+				log(`websocket upload error: ${error instanceof Error ? error.message : String(error)}`);
+				ws.close(1011, 'Upload processing failed');
+				await cleanup_upload_session();
+			}
+		},
+
+		async close(ws, code, reason) {
+			if (current_upload) {
+				log(`websocket connection closed during upload (code: ${code}, reason: ${reason})`);
+				await cleanup_upload_session();
+			}
 		}
+	});
 
-		return 200;
-	}, 'POST');
 }
