@@ -222,8 +222,8 @@ export function init(server: SpooderServer) {
 
 	schedule_update();
 
-	server.route('/wow.export/v2/trigger_update/:key/:build/:msize/:csize', async (req, url) => {
-		const key = url.searchParams.get('key');
+	server.route('/wow.export/v2/trigger_update/:build/:msize/:csize', async (req, url) => {
+		const key = req.headers.get('authorization');
 		const expected_key = process.env.WOW_EXPORT_V2_UPDATE_KEY;
 
 		if (!expected_key || key !== expected_key)
