@@ -364,6 +364,8 @@ export function init(server: SpooderServer) {
 				if (mb_written > 0 && current_upload.bytes_written % (10 * 1024 * 1024) < chunk_size)
 					log(`websocket upload progress: ${mb_written} MB / ${mb_total} MB`);
 
+				ws.send('ack');
+
 				if (current_upload.bytes_written === current_upload.t_size) {
 					await current_upload.file_handle.end();
 					await process_websocket_upload(ws);
