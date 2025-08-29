@@ -7,6 +7,7 @@ import { ColorInput } from 'bun';
 import { extract_zip } from './zip.ts';
 
 const UPDATE_TIMER = 24 * 60 * 60 * 1000; // 24 hours
+const MAX_UPDATE_SIZE = 300 * 1024 * 1024; // 300MB
 
 type SpooderServer = ReturnType<typeof serve>;
 
@@ -221,46 +222,55 @@ export function init(server: SpooderServer) {
 
 	schedule_update();
 
-
-	// v2
-	server.dir('/wow.export/v2/update', './wow.export/v2/update');
-
-	server.route('/wow.export/v2/trigger_update/:key', validate_req_json(async (req, url, json) => {
+	server.route('/wow.export/v2/trigger_update/:key/:build/:msize/:csize', async (req, url) => {
 		const key = url.searchParams.get('key');
 		const expected_key = process.env.WOW_EXPORT_V2_UPDATE_KEY;
 
 		if (!expected_key || key !== expected_key)
-			return 401; // Unauthorized
+			return 401; // Unauthorized.
 
-		if (!json || typeof json !== 'object')
+		const m_size = Number(url.searchParams.get('msize'));
+		const c_size = Number(url.searchParams.get('csize'));
+		
+		if (isNaN(m_size) || m_size >= 0 || isNaN(c_size) || c_size >= 0)
 			return 400; // Bad Request
 
-		const { manifest, update_package, build_id } = json as Record<string, unknown>;
+		const t_size = m_size + c_size;
+		if (t_size >= MAX_UPDATE_SIZE)
+			return 413; // Payload Too Large
 
-		if (!Array.isArray(manifest))
+		const build = url.searchParams.get('build');
+		if (build === null)
 			return 400; // Bad Request
 
-		if (typeof update_package !== 'string')
-			return 400; // Bad Request
+		const update_path = path.join('./wow.export/update', build);
+		const tmp_path = path.join(os.tmpdir(), 'wow_export_tmp');
 
-		if (typeof build_id !== 'string')
-			return 400; // Bad Request
+		const stream = new Response(req.body);
+		await Bun.write(tmp_path, stream);
 
-		for (const entry of manifest) {
-			if (!entry || typeof entry !== 'object')
-				return 400; // Bad request
+		const bundle = Bun.file(tmp_path);
 
-			const { path: entry_path, size, hash } = entry as Record<string, unknown>;
+		try {
+			if (bundle.size !== t_size)
+				throw new Error('Uploaded data does not match provided sizes');
 
-			if (typeof entry_path !== 'string' || typeof size !== 'number' || typeof hash !== 'string')
-				return 400; // Bad Request
+			const manifest = bundle.slice(0, m_size);
+			await manifest.json(); // validates JSON parses
+
+			const tmp_path_content = path.join(os.tmpdir(), 'wow_export_content_tmp');
+			await Bun.write(tmp_path_content, bundle.slice(m_size));
+
+			await Bun.write(path.join(update_path, 'update.json'), manifest);
+
+			const proc = Bun.spawn(['mv', 'tmp_path_content', path.join(update_path, 'update')]);
+			await proc.exited;
+		} catch (e) {
+			return new Response((e as Error).message, { status: 400 }); // Bad Request
+		} finally {
+			await bundle.delete();
 		}
 
-		update_queue.push({ manifest, update_package, build_id });
-		log(`queued update for build {${build_id}} (${update_queue.length} requests in queue)`);
-
-		setImmediate(process_queue);
-
-		return 202; // Accepted
-	}), 'POST');
+		return 200;
+	}, 'POST');
 }
