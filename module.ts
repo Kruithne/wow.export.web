@@ -1,4 +1,4 @@
-import { serve, caution, validate_req_json } from 'spooder';
+import { http_serve, caution } from 'spooder';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import fs from 'node:fs/promises';
@@ -9,7 +9,7 @@ import { extract_zip } from './zip.ts';
 const UPDATE_TIMER = 24 * 60 * 60 * 1000; // 24 hours
 const MAX_UPDATE_SIZE = 300 * 1024 * 1024; // 300MB
 
-type SpooderServer = ReturnType<typeof serve>;
+type SpooderServer = ReturnType<typeof http_serve>;
 
 const ANSI_RESET = '\x1b[0m';
 function log(message: string, color: ColorInput = 'orange'): void {
@@ -288,9 +288,7 @@ export function init(server: SpooderServer) {
 	schedule_update();
 
 	server.websocket('/wow.export/v2/trigger_update/:build/:msize/:csize', {
-		accept(req) {
-			const url = new URL(req.url);
-
+		accept(req, url) {
 			if (is_uploading)
 				return false;
 
