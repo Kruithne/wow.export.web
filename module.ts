@@ -124,7 +124,7 @@ interface UploadSession {
 	t_size: number;
 	temp_file: string;
 	bytes_written: number;
-	chunks: Uint8Array[];
+	file_handle: any;
 }
 
 let is_uploading = false;
@@ -133,6 +133,9 @@ let current_upload: UploadSession | null = null;
 async function cleanup_upload_session() {
 	if (current_upload) {
 		try {
+			if (current_upload.file_handle) {
+				await current_upload.file_handle.end();
+			}
 			await fs.unlink(current_upload.temp_file).catch(() => {}); // ignore errors
 		} catch (error) {
 			// ignore
@@ -317,6 +320,7 @@ export function init(server: SpooderServer) {
 				is_uploading = true;
 
 				const temp_file = path.join(os.tmpdir(), `wow_export_upload_${crypto.randomUUID()}.tmp`);
+				const file_handle = Bun.file(temp_file).writer();
 
 				current_upload = {
 					build,
@@ -325,7 +329,7 @@ export function init(server: SpooderServer) {
 					t_size,
 					temp_file,
 					bytes_written: 0,
-					chunks: []
+					file_handle
 				};
 
 				log(`websocket upload started for build {${build}} (${t_size} bytes expected)`);
@@ -352,7 +356,7 @@ export function init(server: SpooderServer) {
 					return;
 				}
 
-				current_upload.chunks.push(chunk);
+				current_upload.file_handle.write(chunk);
 				current_upload.bytes_written += chunk_size;
 
 				const mb_written = Math.floor(current_upload.bytes_written / (1024 * 1024));
@@ -363,16 +367,8 @@ export function init(server: SpooderServer) {
 				ws.send('ack');
 
 				if (current_upload.bytes_written === current_upload.t_size) {
-					log(`all chunks received, writing to file ${current_upload.temp_file}`);
-					const combined_data = new Uint8Array(current_upload.t_size);
-					let offset = 0;
-					
-					for (const chunk of current_upload.chunks) {
-						combined_data.set(chunk, offset);
-						offset += chunk.length;
-					}
-
-					await Bun.write(current_upload.temp_file, combined_data);
+					await current_upload.file_handle.end();
+				
 					await process_websocket_upload(ws);
 				}
 			} catch (error) {
