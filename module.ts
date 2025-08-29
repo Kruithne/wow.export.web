@@ -288,41 +288,45 @@ export function init(server: SpooderServer) {
 	schedule_update();
 
 	async function trigger_update(build_tag: string, json: any) {
-		log(`accepting update for ${build_tag}`);
+		try {
+			log(`accepting update for ${build_tag}`);
 
-		// update file
-		log(`downloading update file from ${json.update_url}`);
-		const update_res = await fetch(json.update_url);
-		if (!update_res.ok)
-			return HTTP_STATUS_CODE.FailedDependency_424;
+			// update file
+			log(`downloading update file from ${json.update_url}`);
+			const update_res = await fetch(json.update_url);
+			if (!update_res.ok)
+				throw new Error('failed to download update file');
 
-		const update_out_path = `./wow.export/update/${build_tag}/`;
-		const tmp_path = update_out_path + 'update.tmp';
-		await Bun.write(tmp_path, update_res);
+			const update_out_path = `./wow.export/update/${build_tag}/`;
+			const tmp_path = update_out_path + 'update.tmp';
+			await Bun.write(tmp_path, update_res);
 
-		// manifest file
-		log(`downloading manifest from ${json.manifest_url}`);
-		const manifest_res = await fetch(json.manifest_url);
-		if (!manifest_res.ok)
-			return HTTP_STATUS_CODE.FailedDependency_424;
+			// manifest file
+			log(`downloading manifest from ${json.manifest_url}`);
+			const manifest_res = await fetch(json.manifest_url);
+			if (!manifest_res.ok)
+				throw new Error('failed to download manifest');
 
-		const tmp_manifest_path = update_out_path + 'update.json.tmp';
-		await Bun.write(tmp_manifest_path, manifest_res);
+			const tmp_manifest_path = update_out_path + 'update.json.tmp';
+			await Bun.write(tmp_manifest_path, manifest_res);
 
-		// move new update into place
-		await fs.rename(tmp_path, update_out_path + 'update');
-		await fs.rename(tmp_manifest_path, update_out_path + 'update.json');
-		
-		// package archive
-		log(`downloading archive file from ${json.package_url}`);
-		const package_res = await fetch(json.package_url);
-		if (!package_res.ok)
-			return HTTP_STATUS_CODE.FailedDependency_424;
+			// move new update into place
+			await fs.rename(tmp_path, update_out_path + 'update');
+			await fs.rename(tmp_manifest_path, update_out_path + 'update.json');
+			
+			// package archive
+			log(`downloading archive file from ${json.package_url}`);
+			const package_res = await fetch(json.package_url);
+			if (!package_res.ok)
+				throw new Error('failed to download archive file');
 
-		const package_out_path = `./wow.export/download/${build_tag}/`;
-		const package_basename = path.basename(json.package_url);
+			const package_out_path = `./wow.export/download/${build_tag}/`;
+			const package_basename = path.basename(json.package_url);
 
-		await Bun.write(path.join(package_out_path, package_basename), package_res);
+			await Bun.write(path.join(package_out_path, package_basename), package_res);
+		} catch (e) {
+			caution('wow.export update failed', { e, build_tag, json });
+		}
 	}
 
 	server.json('/wow.export/v2/trigger_update/:build', async (req, url, json) => {
