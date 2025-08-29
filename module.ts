@@ -339,7 +339,7 @@ export function init(server: SpooderServer) {
 		if (typeof json.update_url !== 'string' || typeof json.package_url !== 'string' || typeof json.manifest_url !== 'string')
 			return HTTP_STATUS_CODE.BadRequest_400;
 
-		trigger_update(json as any, build_tag);
+		trigger_update(build_tag, json);
 		return HTTP_STATUS_CODE.Accepted_202;
 	});
 }
