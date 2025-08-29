@@ -291,24 +291,17 @@ export function init(server: SpooderServer) {
 		accept(req) {
 			const url = new URL(req.url);
 
-			if (is_uploading) {
-				console.log('is_uploading failure');
+			if (is_uploading)
 				return false;
-			}
 
 			const key = req.headers.get('authorization');
 			const expected_key = process.env.WOW_EXPORT_V2_UPDATE_KEY;
-			if (!expected_key || key !== expected_key) {
-				console.log('key failure');
-				console.log({ expected_key, key });
+			if (!expected_key || key !== expected_key)
 				return false;
-			}
 
 			const build = url.searchParams.get('build');
 			const m_size = Number(url.searchParams.get('msize'));
 			const c_size = Number(url.searchParams.get('csize'));
-
-			console.log({ build, m_size, c_size });
 
 			if (!build || isNaN(m_size) || m_size <= 0 || isNaN(c_size) || c_size <= 0)
 				return false;
