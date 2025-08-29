@@ -299,7 +299,7 @@ export function init(server: SpooderServer) {
 
 			const update_out_path = `./wow.export/update/${build_tag}/`;
 			const tmp_path = update_out_path + 'update.tmp';
-			await Bun.write(tmp_path, update_res);
+			await Bun.write(tmp_path, await update_res.arrayBuffer());
 
 			// manifest file
 			log(`downloading manifest from ${json.manifest_url}`);
@@ -308,7 +308,7 @@ export function init(server: SpooderServer) {
 				throw new Error('failed to download manifest');
 
 			const tmp_manifest_path = update_out_path + 'update.json.tmp';
-			await Bun.write(tmp_manifest_path, manifest_res);
+			await Bun.write(tmp_manifest_path, await manifest_res.arrayBuffer());
 
 			// move new update into place
 			await fs.rename(tmp_path, update_out_path + 'update');
@@ -323,7 +323,7 @@ export function init(server: SpooderServer) {
 			const package_out_path = `./wow.export/download/${build_tag}/`;
 			const package_basename = path.basename(json.package_url);
 
-			await Bun.write(path.join(package_out_path, package_basename), package_res);
+			await Bun.write(path.join(package_out_path, package_basename), await package_res.arrayBuffer());
 		} catch (e) {
 			caution('wow.export update failed', { e, build_tag, json });
 		}
