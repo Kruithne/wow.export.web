@@ -255,11 +255,11 @@ export function init(server: SpooderServer) {
 			if (bundle.size !== t_size)
 				throw new Error('Uploaded data does not match provided sizes');
 
-			const manifest = bundle.slice(0, m_size);
+			const manifest = bundle.slice(c_size);
 			await manifest.json(); // validates JSON parses
 
 			const tmp_path_content = path.join(os.tmpdir(), 'wow_export_content_tmp');
-			await Bun.write(tmp_path_content, bundle.slice(m_size));
+			await Bun.write(tmp_path_content, bundle.slice(0, c_size));
 
 			await Bun.write(path.join(update_path, 'update.json'), manifest);
 
