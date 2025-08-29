@@ -287,20 +287,7 @@ export function init(server: SpooderServer) {
 
 	schedule_update();
 
-	server.json('/wow.export/v2/trigger_update/:build', async (req, url, json) => {
-		const key = req.headers.get('authorization');
-		const expected_key = process.env.WOW_EXPORT_V2_UPDATE_KEY;
-
-		if (!expected_key || key !== expected_key)
-			return HTTP_STATUS_CODE.Unauthorized_401;
-
-		const build_tag = url.searchParams.get('build');
-		if (build_tag === null)
-			return HTTP_STATUS_CODE.BadRequest_400;
-
-		if (typeof json.update_url !== 'string' || typeof json.package_url !== 'string' || typeof json.manifest_url !== 'string')
-			return HTTP_STATUS_CODE.BadRequest_400;
-
+	async function trigger_update(build_tag: string, json: any) {
 		log(`accepting update for ${build_tag}`);
 
 		// update file
@@ -336,7 +323,23 @@ export function init(server: SpooderServer) {
 		const package_basename = path.basename(json.package_url);
 
 		await Bun.write(path.join(package_out_path, package_basename), package_res);
+	}
 
-		return HTTP_STATUS_CODE.OK_200;
+	server.json('/wow.export/v2/trigger_update/:build', async (req, url, json) => {
+		const key = req.headers.get('authorization');
+		const expected_key = process.env.WOW_EXPORT_V2_UPDATE_KEY;
+
+		if (!expected_key || key !== expected_key)
+			return HTTP_STATUS_CODE.Unauthorized_401;
+
+		const build_tag = url.searchParams.get('build');
+		if (build_tag === null)
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		if (typeof json.update_url !== 'string' || typeof json.package_url !== 'string' || typeof json.manifest_url !== 'string')
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		trigger_update(json as any, build_tag);
+		return HTTP_STATUS_CODE.Accepted_202;
 	});
 }
