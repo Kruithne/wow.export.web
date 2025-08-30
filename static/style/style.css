@@ -140,8 +140,16 @@ body {
 	background-image: url(../images/fa-patreon.svg);
 }
 
-#intro-button-download {
+#intro-button-windows {
 	background-image: url(../images/fa-windows.svg);
+}
+
+#intro-button-linux {
+	background-image: url(../images/fa-linux.svg);
+}
+
+#intro-button-osx {
+	background-image: url(../images/fa-osx.svg);
 }
 
 #intro-button-github {
