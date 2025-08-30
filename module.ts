@@ -295,29 +295,69 @@ export function init(server: SpooderServer) {
 
 	schedule_update();
 
+	async function stream_to_file(url: string, file_path: string, name: string): Promise<void> {
+		const response = await fetch(url);
+		if (!response.ok)
+			throw new Error(`Failed to fetch ${name}: ${response.status} ${response.statusText}`);
+
+		const content_length = response.headers.get('content-length');
+		const total_size = content_length ? parseInt(content_length, 10) : null;
+
+		if (!total_size || !response.body)
+			throw new Error(`failed to read download stream`);
+
+		const reader = response.body.getReader();
+		const file_handle = Bun.file(file_path);
+		const writer = file_handle.writer();
+
+		let downloaded_bytes = 0;
+		let last_logged_percent = -1;
+
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done)
+					break;
+
+				writer.write(value);
+				downloaded_bytes += value.length;
+
+				if (total_size > 50 * 1024 * 1024) { // log in 50MB chunks
+					const percent = Math.floor((downloaded_bytes / total_size) * 100);
+					if (percent >= last_logged_percent + 10 && percent <= 100) {
+						const downloaded_mb = (downloaded_bytes / (1024 * 1024)).toFixed(1);
+						const total_mb = (total_size / (1024 * 1024)).toFixed(1);
+
+						log(`downloading ${name}: ${percent}% (${downloaded_mb} MB / ${total_mb} MB)`);
+						last_logged_percent = percent;
+					}
+				}
+			}
+		} finally {
+			await writer.end();
+			reader.releaseLock();
+		}
+	}
+
 	async function process_trigger_update(build_tag: string, json: any) {
 		try {
 			log(`accepting update for ${build_tag}`);
 
+			const update_out_path = `./wow.export/update/${build_tag}/`;
+			const package_out_path = `./wow.export/download/${build_tag}/`;
+			
+			await fs.mkdir(update_out_path, { recursive: true });
+			await fs.mkdir(package_out_path, { recursive: true });
+
 			// update file
 			log(`downloading update file from ${json.update_url}`);
-			const update_res = await fetch(json.update_url);
-			if (!update_res.ok)
-				throw new Error('failed to download update file');
-
-			const update_out_path = `./wow.export/update/${build_tag}/`;
 			const tmp_path = update_out_path + 'update.tmp';
-			await fs.mkdir(update_out_path, { recursive: true });
-			await Bun.write(tmp_path, await update_res.arrayBuffer());
+			await stream_to_file(json.update_url, tmp_path, 'update file');
 
 			// manifest file
 			log(`downloading manifest from ${json.manifest_url}`);
-			const manifest_res = await fetch(json.manifest_url);
-			if (!manifest_res.ok)
-				throw new Error('failed to download manifest');
-
 			const tmp_manifest_path = update_out_path + 'update.json.tmp';
-			await Bun.write(tmp_manifest_path, await manifest_res.arrayBuffer());
+			await stream_to_file(json.manifest_url, tmp_manifest_path, 'manifest');
 
 			// move new update into place
 			await fs.rename(tmp_path, update_out_path + 'update');
@@ -325,15 +365,9 @@ export function init(server: SpooderServer) {
 			
 			// package archive
 			log(`downloading archive file from ${json.package_url}`);
-			const package_res = await fetch(json.package_url);
-			if (!package_res.ok)
-				throw new Error('failed to download archive file');
-
-			const package_out_path = `./wow.export/download/${build_tag}/`;
 			const package_basename = path.basename(json.package_url);
-
-			await fs.mkdir(package_out_path, { recursive: true });
-			await Bun.write(path.join(package_out_path, package_basename), await package_res.arrayBuffer());
+			const package_file_path = path.join(package_out_path, package_basename);
+			await stream_to_file(json.package_url, package_file_path, 'archive');
 			
 			log(`successfully updated ${build_tag}`);
 		} catch (e) {
