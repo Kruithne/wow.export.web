@@ -4,10 +4,8 @@ import os from 'node:os';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ColorInput } from 'bun';
-import { extract_zip } from './zip.ts';
 
 const UPDATE_TIMER = 24 * 60 * 60 * 1000; // 24 hours
-const MAX_UPDATE_SIZE = 300 * 1024 * 1024; // 300MB
 
 type SpooderServer = ReturnType<typeof http_serve>;
 
@@ -108,15 +106,6 @@ async function update_tact() {
 let index: string|null = null;
 let index_hash: string|null = null;
 
-interface UpdateRequest {
-	manifest: any[];
-	update_package: string;
-	build_id: string;
-}
-
-let update_queue: UpdateRequest[] = [];
-let is_processing_update = false;
-
 interface TriggerUpdateRequest {
 	build_tag: string;
 	json: any;
@@ -124,139 +113,6 @@ interface TriggerUpdateRequest {
 
 let trigger_update_queue: TriggerUpdateRequest[] = [];
 let is_processing_trigger_update = false;
-
-interface UploadSession {
-	build: string;
-	m_size: number;
-	c_size: number;
-	t_size: number;
-	temp_file: string;
-	bytes_written: number;
-	file_handle: any;
-}
-
-let is_uploading = false;
-let current_upload: UploadSession | null = null;
-
-async function cleanup_upload_session() {
-	if (current_upload) {
-		try {
-			if (current_upload.file_handle) {
-				await current_upload.file_handle.end();
-			}
-			await fs.unlink(current_upload.temp_file).catch(() => {}); // ignore errors
-		} catch (error) {
-			// ignore
-		}
-
-		current_upload = null;
-	}
-	is_uploading = false;
-}
-
-async function process_websocket_upload(ws: any) {
-	if (!current_upload) {
-		ws.close(1011, 'No upload session');
-		return;
-	}
-
-	const { build, c_size, temp_file } = current_upload;
-
-	try {
-		const update_path = path.join('./wow.export/update', build);
-		const bundle = Bun.file(temp_file);
-
-		const manifest_data = bundle.slice(c_size);
-		const manifest = await manifest_data.json(); // validates JSON parses
-		
-		const tmp_path_content = path.join(os.tmpdir(), 'wow_export_content_tmp');
-		await Bun.write(tmp_path_content, bundle.slice(0, c_size));
-
-		await fs.mkdir(update_path, { recursive: true });
-
-		await Bun.write(path.join(update_path, 'update.json'), manifest_data);
-
-		const proc = Bun.spawn(['mv', tmp_path_content, path.join(update_path, 'update')]);
-		await proc.exited;
-
-		log(`websocket upload completed successfully for build {${build}}`);
-		ws.close(1000, 'Upload complete');
-		await cleanup_upload_session();
-	} catch (error) {
-		const errorMsg = error instanceof Error ? error.message : String(error);
-		log(`websocket upload processing failed: ${errorMsg}`);
-		ws.close(1011, 'Processing failed');
-		await cleanup_upload_session();
-	}
-}
-
-async function process_update_request(request: UpdateRequest) {
-	const { manifest, update_package, build_id } = request;
-	
-	try {
-		const temp_dir = './temp';
-		const temp_archive = path.join(temp_dir, 'build_archive.zip');
-		const temp_files = path.join(temp_dir, 'files');
-		const manifest_path = `./wow.export/v2/update/manifest/${build_id}.json`;
-		const dist_path = `./wow.export/v2/update/dist/${build_id}`;
-
-		await fs.mkdir(temp_dir, { recursive: true });
-
-		log(`downloading update package from {${update_package}}`);
-		const response = await fetch(update_package);
-		if (!response.ok)
-			throw new Error(`Failed to download update package: ${response.status} ${response.statusText}`);
-
-		await Bun.write(temp_archive, response);
-
-		log(`blanking existing manifest at {${manifest_path}}`);
-		await fs.mkdir(path.dirname(manifest_path), { recursive: true });
-		await fs.writeFile(manifest_path, '[]');
-
-		log(`extracting archive to {${temp_files}}`);
-		await extract_zip(temp_archive, temp_files);
-
-		log(`removing existing distribution folder {${dist_path}}`);
-		await fs.rm(dist_path, { recursive: true, force: true });
-
-		log(`moving extracted files to {${dist_path}}`);
-		await fs.mkdir(path.dirname(dist_path), { recursive: true });
-		await fs.rename(temp_files, dist_path);
-
-		log(`writing new manifest to {${manifest_path}}`);
-		await fs.writeFile(manifest_path, JSON.stringify(manifest, null, 2));
-
-		log(`cleaning up temporary files`);
-		await fs.rm(temp_dir, { recursive: true, force: true });
-
-		log(`successfully updated build {${build_id}}`);
-	} catch (error) {
-		caution('wow_export build update failed', { error: error instanceof Error ? error.message : String(error) });
-		throw error;
-	}
-}
-
-async function process_queue() {
-	if (is_processing_update || update_queue.length === 0)
-		return;
-
-	is_processing_update = true;
-	log(`processing update queue ({${update_queue.length}} requests pending)`);
-
-	while (update_queue.length > 0) {
-		const request = update_queue.shift()!;
-		log(`processing update for build {${request.build_id}}`);
-		
-		try {
-			await process_update_request(request);
-		} catch (error) {
-			log(`failed to process update for build {${request.build_id}}: ${error instanceof Error ? error.message : String(error)}`);
-		}
-	}
-
-	is_processing_update = false;
-	log(`update queue processing complete`);
-}
 
 export function init(server: SpooderServer) {
 	server.route('/wow.export', async (req) => {
