@@ -103,8 +103,18 @@ body {
 	bottom: 0;
 }
 
+@keyframes rotate {
+	from {
+		transform: rotate(0deg);
+	}
+	to {
+		transform: rotate(360deg);
+	}
+}
+
 #logo-compart-outer {
 	background-image: url(../images/logo_compart_outer.png);
+	animation: rotate 20s linear infinite;
 }
 
 #logo-compart-middle {
