@@ -117,6 +117,14 @@ interface UpdateRequest {
 let update_queue: UpdateRequest[] = [];
 let is_processing_update = false;
 
+interface TriggerUpdateRequest {
+	build_tag: string;
+	json: any;
+}
+
+let trigger_update_queue: TriggerUpdateRequest[] = [];
+let is_processing_trigger_update = false;
+
 interface UploadSession {
 	build: string;
 	m_size: number;
@@ -287,7 +295,7 @@ export function init(server: SpooderServer) {
 
 	schedule_update();
 
-	async function trigger_update(build_tag: string, json: any) {
+	async function process_trigger_update(build_tag: string, json: any) {
 		try {
 			log(`accepting update for ${build_tag}`);
 
@@ -299,6 +307,7 @@ export function init(server: SpooderServer) {
 
 			const update_out_path = `./wow.export/update/${build_tag}/`;
 			const tmp_path = update_out_path + 'update.tmp';
+			await fs.mkdir(update_out_path, { recursive: true });
 			await Bun.write(tmp_path, await update_res.arrayBuffer());
 
 			// manifest file
@@ -323,10 +332,37 @@ export function init(server: SpooderServer) {
 			const package_out_path = `./wow.export/download/${build_tag}/`;
 			const package_basename = path.basename(json.package_url);
 
+			await fs.mkdir(package_out_path, { recursive: true });
 			await Bun.write(path.join(package_out_path, package_basename), await package_res.arrayBuffer());
+			
+			log(`successfully updated ${build_tag}`);
 		} catch (e) {
 			caution('wow.export update failed', { e, build_tag, json });
 		}
+	}
+
+	async function process_trigger_update_queue() {
+		if (is_processing_trigger_update || trigger_update_queue.length === 0)
+			return;
+
+		is_processing_trigger_update = true;
+		log(`processing trigger update queue (${trigger_update_queue.length} requests pending)`);
+
+		while (trigger_update_queue.length > 0) {
+			const request = trigger_update_queue.shift()!;
+			log(`processing trigger update for build ${request.build_tag}`);
+			
+			await process_trigger_update(request.build_tag, request.json);
+		}
+
+		is_processing_trigger_update = false;
+		log(`trigger update queue processing complete`);
+	}
+
+	function trigger_update(build_tag: string, json: any) {
+		trigger_update_queue.push({ build_tag, json });
+		log(`queued trigger update for ${build_tag} (${trigger_update_queue.length} in queue)`);
+		process_trigger_update_queue();
 	}
 
 	server.json('/wow.export/v2/trigger_update/:build', async (req, url, json) => {
