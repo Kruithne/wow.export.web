@@ -135,8 +135,15 @@ export function init(server: SpooderServer) {
 
 	server.route('/wow.export/data/dbd', async (req, url) => {
 		const def = url.searchParams.get('def');
-		if (def === null)
-			return 404;
+		if (def === null) {
+			const api_response = await fetch('https://api.github.com/repos/wowdev/WoWDBDefs/git/trees/master?recursive=1');
+			return new Response(api_response.body, {
+				status: api_response.status,
+				headers: {
+					'Content-Type': 'application/json'
+				}
+			});
+		}
 
 		const dbd = await fetch(`https://raw.githubusercontent.com/wowdev/WoWDBDefs/master/definitions/${def}.dbd`);
 		return new Response(dbd.body, {
