@@ -279,8 +279,4 @@ export function init(server: SpooderServer) {
 		trigger_update(build_tag, json);
 		return HTTP_STATUS_CODE.Accepted_202;
 	});
-
-	server.json('/wow.export/v2/test/:foo', (req, url, json) => {
-		return { 'foo': url.searchParams.get('foo') };
-	});
 }
