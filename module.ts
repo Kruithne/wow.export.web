@@ -279,4 +279,8 @@ export function init(server: SpooderServer) {
 		trigger_update(build_tag, json);
 		return HTTP_STATUS_CODE.Accepted_202;
 	});
+
+	server.route('/wow.export/v2/test', (req, url) => {
+		return 'Hello, world!';
+	});
 }
