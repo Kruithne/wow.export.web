@@ -1,4 +1,4 @@
-import { http_serve, caution, HTTP_STATUS_CODE } from 'spooder';
+import { http_serve, caution, parse_template, HTTP_STATUS_CODE } from 'spooder';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import fs from 'node:fs/promises';
@@ -111,13 +111,24 @@ interface TriggerUpdateRequest {
 	json: any;
 }
 
+const RELEASE_BUILD_FILE = './wow.export/data/release_builds.json';
+
 let trigger_update_queue: TriggerUpdateRequest[] = [];
 let is_processing_trigger_update = false;
 
-export function init(server: SpooderServer) {
+let release_builds: Record<string, string> = {}; // automatically populated
+
+export async function init(server: SpooderServer) {
+	try {
+		release_builds = await Bun.file(RELEASE_BUILD_FILE).json();
+	} catch (e) {
+		log(`failed to load RELEASE_BUILD_FILE ${RELEASE_BUILD_FILE}: ${(e as Error).message}`);
+	}
+
 	server.route('/wow.export', async (req) => {
 		if (index === null) {
 			index = await Bun.file('./wow.export/index.html').text();
+			index = await parse_template(index, release_builds, true);
 			index_hash = crypto.createHash('sha256').update(index).digest('hex');
 		}
 		
@@ -231,8 +242,15 @@ export function init(server: SpooderServer) {
 			const package_basename = path.basename(json.package_url);
 			const package_file_path = path.join(package_out_path, package_basename);
 			await stream_to_file(json.package_url, package_file_path, 'archive');
+
+			// update release builds
+			log(`updating release build of {${build_tag}} to {${package_basename}}`);
+			release_builds[build_tag] = package_basename;
+			index = null; // force index re-render
+
+			await Bun.write(RELEASE_BUILD_FILE, JSON.stringify(release_builds));
 			
-			log(`successfully updated ${build_tag}`);
+			log(`successfully updated {${build_tag}}`);
 		} catch (e) {
 			caution('wow.export update failed', { e, build_tag, json });
 		}

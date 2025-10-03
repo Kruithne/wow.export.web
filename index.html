@@ -40,11 +40,15 @@
 				</div>
 			</div>
 			<div id="intro-right">
-				<a href="https://www.kruithne.net/wow.export/download/win-x64/wow-export-win-x64-0.2.0.zip" id="intro-button-windows">Download for Windows</a>
-				<a href="https://www.kruithne.net/wow.export/download/linux-x64/wow-export-linux-x64-0.2.1.tar.gz" id="intro-button-linux">Download for Linux</a>
-				<!--
-				<a href="https://www.kruithne.net/wow.export/download/osx-x64/wow.export-0.1.66.zip" id="intro-button-osx">Download for macOS</a>
-				-->
+				<t-if test="win-x64">
+					<a href="https://www.kruithne.net/wow.export/download/win-x64/{{ win-x64 }}" id="intro-button-windows">Download for Windows</a>
+				</t-if>
+				<t-if test="linux-x64">
+					<a href="https://www.kruithne.net/wow.export/download/linux-x64/{{ linux-x64 }}" id="intro-button-linux">Download for Linux</a>
+				</t-if>
+				<t-if test="osx-x64">
+					<a href="https://www.kruithne.net/wow.export/download/osx-x64/{{ osx-x64 }}" id="intro-button-osx">Download for macOS</a>
+				</t-if>
 				<a href="https://discord.gg/kC3EzAYBtf" id="intro-button-discord" target="_blank">Get Help on Discord</a>
 				<a href="https://www.patreon.com/kruithne" id="intro-button-patreon" target="_blank">Support on Patreon</a>
 				<a href="https://github.com/Kruithne/wow.export" id="intro-button-github" target="_blank">View Source on GitHub</a>
