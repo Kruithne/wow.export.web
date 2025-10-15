@@ -6,6 +6,7 @@ import path from 'node:path';
 import { ColorInput } from 'bun';
 
 const UPDATE_TIMER = 24 * 60 * 60 * 1000; // 24 hours
+const LISTFILE_HASH_THRESHOLD = 100;
 
 type SpooderServer = ReturnType<typeof http_serve>;
 
@@ -86,14 +87,258 @@ async function update_data_files() {
 }
 
 function schedule_update() {
+	update_listfile(); // todo: remove me.
 	setTimeout(update_data_files, UPDATE_TIMER);
+}
+
+interface ListfileEntry {
+	id: number;
+	filename: string;
+	name_bytes: Uint8Array;
+	string_offset: number;
+}
+
+interface TreeNode {
+	children: Map<string, TreeNode>;
+	files: Array<{ filename: string; fileId: number }>;
+}
+
+async function b_listfile_build(target_dir: string): Promise<void> {
+	log('build_binary_listfiles :: start');
+
+	const master_file = path.join(target_dir, 'master');
+	const csv_content = await Bun.file(master_file).text();
+
+	const entries = b_listfile_parse_entries(csv_content);
+	log(`b_listfile_parse_entries :: parsed {${entries.length}} entries`);
+
+	const tree = b_listfile_build_tree(entries);
+	log('b_listfile_build_tree :: done');
+
+	await b_listfile_write_files(target_dir, entries, tree);
+	log('b_listfile_write_files :: done');
+}
+
+function b_listfile_parse_entries(csv_content: string): ListfileEntry[] {
+	const entries: ListfileEntry[] = [];
+	let string_offset = 0;
+
+	const lines = csv_content.split('\n');
+	for (const line of lines) {
+		if (line.length === 0)
+			continue;
+
+		const tokens = line.split(';');
+		if (tokens.length !== 2)
+			continue;
+
+		const file_data_id = Number(tokens[0]);
+		if (isNaN(file_data_id))
+			continue;
+
+		const filename = tokens[1].toLowerCase();
+		const name_bytes = new TextEncoder().encode(filename);
+
+		entries.push({
+			id: file_data_id,
+			filename,
+			name_bytes,
+			string_offset
+		});
+
+		string_offset += name_bytes.length;
+	}
+
+	return entries;
+}
+
+function b_listfile_build_tree(entries: ListfileEntry[]): Map<string, TreeNode> {
+	const tree = new Map<string, TreeNode>();
+
+	for (const entry of entries)
+		b_listfile_add_node(tree, entry.filename, entry.id);
+
+	return tree;
+}
+
+function b_listfile_add_node(tree: Map<string, TreeNode>, file_path: string, file_id: number): void {
+	const components = file_path.split('/');
+	let current_level = tree;
+
+	for (let i = 0; i < components.length - 1; i++) {
+		const component = components[i];
+
+		if (!current_level.has(component)) {
+			current_level.set(component, {
+				children: new Map(),
+				files: []
+			});
+		}
+
+		current_level = current_level.get(component)!.children;
+	}
+
+	const filename = components[components.length - 1];
+	if (!current_level.has('<files>')) {
+		current_level.set('<files>', {
+			children: new Map(),
+			files: []
+		});
+	}
+
+	current_level.get('<files>')!.files.push({ filename, fileId: file_id });
+}
+
+async function b_listfile_write_files(target_dir: string, entries: ListfileEntry[], tree: Map<string, TreeNode>): Promise<void> {
+	await b_listfile_write_strings(target_dir, entries);
+	await b_listfile_write_index(target_dir, entries);
+	await b_listfile_write_tree(target_dir, tree);
+}
+
+async function b_listfile_write_strings(target_dir: string, entries: ListfileEntry[]): Promise<void> {
+	const total_size = entries.reduce((sum, e) => sum + e.name_bytes.length, 0);
+	const buffer = new ArrayBuffer(total_size);
+	const view = new Uint8Array(buffer);
+	let write_pos = 0;
+
+	for (const entry of entries) {
+		view.set(entry.name_bytes, write_pos);
+		write_pos += entry.name_bytes.length;
+	}
+
+	const file_path = path.join(target_dir, 'listfile-strings.dat');
+	await Bun.write(file_path, buffer);
+}
+
+async function b_listfile_write_index(target_dir: string, entries: ListfileEntry[]): Promise<void> {
+	const sorted_entries = [...entries].sort((a, b) => a.id - b.id);
+
+	// format: [id:4][stringOffset:4] = 8 bytes per entry
+	const buffer = new ArrayBuffer(sorted_entries.length * 8);
+	const view = new DataView(buffer);
+	let index_pos = 0;
+
+	for (const entry of sorted_entries) {
+		view.setUint32(index_pos, entry.id, false);
+		view.setUint32(index_pos + 4, entry.string_offset, false);
+		index_pos += 8;
+	}
+
+	const file_path = path.join(target_dir, 'listfile-id-index.dat');
+	await Bun.write(file_path, buffer);
+}
+
+async function b_listfile_write_tree(target_dir: string, tree: Map<string, TreeNode>): Promise<void> {
+	const node_data: ArrayBuffer[] = [];
+	const component_idx = new Map<string, number>();
+
+	b_listfile_serialize_tree_node(tree, node_data, component_idx, '<root>');
+
+	const total_node_size = node_data.reduce((sum, buf) => sum + buf.byteLength, 0);
+	const node_buffer = new ArrayBuffer(total_node_size);
+	const node_view = new Uint8Array(node_buffer);
+	let copy_pos = 0;
+
+	for (const buffer of node_data) {
+		node_view.set(new Uint8Array(buffer), copy_pos);
+		copy_pos += buffer.byteLength;
+	}
+
+	const nodes_path = path.join(target_dir, 'listfile-tree-nodes.dat');
+	await Bun.write(nodes_path, node_buffer);
+
+	// format: [componentHash:8][nodeOffset:4] = 12 bytes per entry
+	const idx_entries = Array.from(component_idx.entries());
+	const idx_buffer = new ArrayBuffer(idx_entries.length * 12);
+	const idx_view = new DataView(idx_buffer);
+	let index_pos = 0;
+
+	for (const [component, offset] of idx_entries) {
+		const component_hash = Bun.hash.xxHash64(component);
+		idx_view.setBigUint64(index_pos, component_hash, false);
+		idx_view.setUint32(index_pos + 8, offset, false);
+		index_pos += 12;
+	}
+
+	const idx_path = path.join(target_dir, 'listfile-tree-index.dat');
+	await Bun.write(idx_path, idx_buffer);
+}
+
+function b_listfile_serialize_tree_node(node_map: Map<string, TreeNode>, node_data: ArrayBuffer[], component_idx: Map<string, number>, component_name: string): number {
+	const current_ofs = node_data.reduce((sum, buf) => sum + buf.byteLength, 0);
+	if (component_name !== '<root>')
+		component_idx.set(component_name, current_ofs);
+
+	const children = Array.from(node_map.entries());
+	const files = children.find(([name]) => name === '<files>')?.[1]?.files || [];
+	const actual_children = children.filter(([name]) => name !== '<files>');
+
+	const is_large_dir = files.length > LISTFILE_HASH_THRESHOLD;
+
+	const header_size = 9 + (actual_children.length * 12); // header + child entries
+	let files_size = 0;
+
+	if (is_large_dir) {
+		files_size = files.length * 12; // hash + id per file
+	} else {
+		files_size = files.reduce((sum, f) => sum + 2 + new TextEncoder().encode(f.filename).length + 4, 0);
+	}
+
+	const node_buffer = new ArrayBuffer(header_size + files_size);
+	const view = new DataView(node_buffer);
+	let pos = 0;
+
+	view.setUint32(pos, actual_children.length, false); pos += 4;
+	view.setUint32(pos, files.length, false); pos += 4;
+	view.setUint8(pos, is_large_dir ? 1 : 0); pos += 1;
+
+	const child_entries_start = pos;
+	pos += actual_children.length * 12;
+
+	if (is_large_dir) {
+		for (const file of files) {
+			const filename_hash = Bun.hash.xxHash64(file.filename);
+			view.setBigUint64(pos, filename_hash, false); pos += 8;
+			view.setUint32(pos, file.fileId, false); pos += 4;
+		}
+	} else {
+		for (const file of files) {
+			const filename_bytes = new TextEncoder().encode(file.filename);
+			view.setUint16(pos, filename_bytes.length, false); pos += 2;
+			new Uint8Array(node_buffer, pos, filename_bytes.length).set(filename_bytes);
+			pos += filename_bytes.length;
+			view.setUint32(pos, file.fileId, false); pos += 4;
+		}
+	}
+
+	node_data.push(node_buffer);
+
+	let child_idx = 0;
+	for (const [child_name, child_node] of actual_children) {
+		const child_ofs = b_listfile_serialize_tree_node(child_node.children, node_data, component_idx, child_name);
+
+		const child_entry_pos = child_entries_start + (child_idx * 12);
+		const child_hash = Bun.hash.xxHash64(child_name);
+		view.setBigUint64(child_entry_pos, child_hash, false);
+		view.setUint32(child_entry_pos + 8, child_ofs, false);
+
+		child_idx++;
+	}
+
+	return current_ofs;
 }
 
 async function update_listfile() {
 	const url = 'https://github.com/wowdev/wow-listfile/releases/latest/download/community-listfile.csv';
 	const target_dir = './wow.export/data/listfile';
-	
+
 	await download_and_store(url, target_dir, 'master', 'listfile');
+
+	try {
+		await b_listfile_build(target_dir);
+	} catch (error) {
+		caution('Failed to build binary listfiles', [error instanceof Error ? error.message : String(error)]);
+	}
 }
 
 async function update_tact() {
