@@ -8,6 +8,16 @@ import { ColorInput } from 'bun';
 const UPDATE_TIMER = 24 * 60 * 60 * 1000; // 24 hours
 const LISTFILE_HASH_THRESHOLD = 100;
 
+const LISTFILE_FLAGS = {
+	TEXTURE: { flag: 0x01, extensions: ['.blp'] },
+	SOUND: { flag: 0x02, extensions: ['.ogg', '.mp3', '.unk_sound'] },
+	MODEL: { flag: 0x04, extensions: ['.m2', '.m3', '.wmo'] },
+	VIDEO: { flag: 0x08, extensions: ['.avi'] },
+	TEXT: { flag: 0x10, extensions: ['.txt', '.lua', '.xml', '.sbt', '.wtf', '.htm', '.toc', '.xsd'] }
+} as const;
+
+const LISTFILE_MODEL_FILTER = /_[0-9]{3}\.wmo$/;
+
 type SpooderServer = ReturnType<typeof http_serve>;
 
 const ANSI_RESET = '\x1b[0m';
@@ -96,6 +106,7 @@ interface ListfileEntry {
 	filename: string;
 	name_bytes: Uint8Array;
 	string_offset: number;
+	flags: number;
 }
 
 interface TreeNode {
@@ -139,11 +150,26 @@ function b_listfile_parse_entries(csv_content: string): ListfileEntry[] {
 		const filename = tokens[1].toLowerCase();
 		const name_bytes = new TextEncoder().encode(filename);
 
+		let flags = 0;
+		for (const category of Object.values(LISTFILE_FLAGS)) {
+			for (const ext of category.extensions) {
+				if (filename.endsWith(ext)) {
+					// omit WMO group files from listfile
+					if (category === LISTFILE_FLAGS.MODEL && ext === '.wmo' && LISTFILE_MODEL_FILTER.test(filename))
+						continue;
+
+					flags |= category.flag;
+					break;
+				}
+			}
+		}
+
 		entries.push({
 			id: file_data_id,
 			filename,
 			name_bytes,
-			string_offset
+			string_offset,
+			flags
 		});
 
 		string_offset += name_bytes.length;
@@ -213,15 +239,16 @@ async function b_listfile_write_strings(target_dir: string, entries: ListfileEnt
 async function b_listfile_write_index(target_dir: string, entries: ListfileEntry[]): Promise<void> {
 	const sorted_entries = [...entries].sort((a, b) => a.id - b.id);
 
-	// format: [id:4][stringOffset:4] = 8 bytes per entry
-	const buffer = new ArrayBuffer(sorted_entries.length * 8);
+	// format: [id:4][stringOffset:4][flags:1] = 9 bytes per entry
+	const buffer = new ArrayBuffer(sorted_entries.length * 9);
 	const view = new DataView(buffer);
 	let index_pos = 0;
 
 	for (const entry of sorted_entries) {
 		view.setUint32(index_pos, entry.id, false);
 		view.setUint32(index_pos + 4, entry.string_offset, false);
-		index_pos += 8;
+		view.setUint8(index_pos + 8, entry.flags);
+		index_pos += 9;
 	}
 
 	const file_path = path.join(target_dir, 'listfile-id-index.dat');
