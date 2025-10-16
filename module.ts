@@ -324,7 +324,13 @@ function b_listfile_serialize_tree_node(node_map: Map<string, TreeNode>, node_da
 	pos += actual_children.length * 12;
 
 	if (is_large_dir) {
-		for (const file of files) {
+		const sorted_files = files.sort((a, b) => {
+			const hash_a = Bun.hash.xxHash64(a.filename);
+			const hash_b = Bun.hash.xxHash64(b.filename);
+			return hash_a < hash_b ? -1 : hash_a > hash_b ? 1 : 0;
+		});
+
+		for (const file of sorted_files) {
 			const filename_hash = Bun.hash.xxHash64(file.filename);
 			view.setBigUint64(pos, filename_hash, false); pos += 8;
 			view.setUint32(pos, file.fileId, false); pos += 4;
@@ -341,8 +347,14 @@ function b_listfile_serialize_tree_node(node_map: Map<string, TreeNode>, node_da
 
 	node_data.push(node_buffer);
 
+	const sorted_children = actual_children.sort((a, b) => {
+		const hash_a = Bun.hash.xxHash64(a[0]);
+		const hash_b = Bun.hash.xxHash64(b[0]);
+		return hash_a < hash_b ? -1 : hash_a > hash_b ? 1 : 0;
+	});
+
 	let child_idx = 0;
-	for (const [child_name, child_node] of actual_children) {
+	for (const [child_name, child_node] of sorted_children) {
 		const child_ofs = b_listfile_serialize_tree_node(child_node.children, node_data, component_idx, child_name);
 
 		const child_entry_pos = child_entries_start + (child_idx * 12);
