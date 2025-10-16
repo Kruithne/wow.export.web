@@ -147,7 +147,7 @@ function b_listfile_parse_entries(csv_content: string): ListfileEntry[] {
 		if (isNaN(file_data_id))
 			continue;
 
-		const filename = tokens[1].toLowerCase();
+		const filename = tokens[1].trim().toLowerCase();
 		const name_bytes = new TextEncoder().encode(filename);
 
 		let flags = 0;
@@ -301,7 +301,20 @@ function b_listfile_serialize_tree_node(node_map: Map<string, TreeNode>, node_da
 	const files = children.find(([name]) => name === '<files>')?.[1]?.files || [];
 	const actual_children = children.filter(([name]) => name !== '<files>');
 
+	actual_children.sort((a, b) => {
+		const hash_a = Bun.hash.xxHash64(a[0]);
+		const hash_b = Bun.hash.xxHash64(b[0]);
+		return hash_a < hash_b ? -1 : hash_a > hash_b ? 1 : 0;
+	});
+
 	const is_large_dir = files.length > LISTFILE_HASH_THRESHOLD;
+	if (is_large_dir) {
+		files.sort((a, b) => {
+			const hash_a = Bun.hash.xxHash64(a.filename);
+			const hash_b = Bun.hash.xxHash64(b.filename);
+			return hash_a < hash_b ? -1 : hash_a > hash_b ? 1 : 0;
+		});
+	}
 
 	const header_size = 9 + (actual_children.length * 12); // header + child entries
 	let files_size = 0;
@@ -324,18 +337,14 @@ function b_listfile_serialize_tree_node(node_map: Map<string, TreeNode>, node_da
 	pos += actual_children.length * 12;
 
 	if (is_large_dir) {
-		const sorted_files = files.sort((a, b) => {
-			const hash_a = Bun.hash.xxHash64(a.filename);
-			const hash_b = Bun.hash.xxHash64(b.filename);
-			return hash_a < hash_b ? -1 : hash_a > hash_b ? 1 : 0;
-		});
-
-		for (const file of sorted_files) {
+		// large directory: use hashes
+		for (const file of files) {
 			const filename_hash = Bun.hash.xxHash64(file.filename);
 			view.setBigUint64(pos, filename_hash, false); pos += 8;
 			view.setUint32(pos, file.fileId, false); pos += 4;
 		}
 	} else {
+		// small directory: store filenames directly
 		for (const file of files) {
 			const filename_bytes = new TextEncoder().encode(file.filename);
 			view.setUint16(pos, filename_bytes.length, false); pos += 2;
@@ -347,22 +356,18 @@ function b_listfile_serialize_tree_node(node_map: Map<string, TreeNode>, node_da
 
 	node_data.push(node_buffer);
 
-	const sorted_children = actual_children.sort((a, b) => {
-		const hash_a = Bun.hash.xxHash64(a[0]);
-		const hash_b = Bun.hash.xxHash64(b[0]);
-		return hash_a < hash_b ? -1 : hash_a > hash_b ? 1 : 0;
-	});
-
-	let child_idx = 0;
-	for (const [child_name, child_node] of sorted_children) {
+	const child_offset_map: Array<{ hash: bigint; offset: number }> = [];
+	for (const [child_name, child_node] of actual_children) {
 		const child_ofs = b_listfile_serialize_tree_node(child_node.children, node_data, component_idx, child_name);
-
-		const child_entry_pos = child_entries_start + (child_idx * 12);
 		const child_hash = Bun.hash.xxHash64(child_name);
-		view.setBigUint64(child_entry_pos, child_hash, false);
-		view.setUint32(child_entry_pos + 8, child_ofs, false);
+		child_offset_map.push({ hash: child_hash, offset: child_ofs });
+	}
 
-		child_idx++;
+	let child_entry_pos = child_entries_start;
+	for (const { hash, offset } of child_offset_map) {
+		view.setBigUint64(child_entry_pos, hash, false);
+		view.setUint32(child_entry_pos + 8, offset, false);
+		child_entry_pos += 12;
 	}
 
 	return current_ofs;
