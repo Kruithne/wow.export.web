@@ -172,7 +172,7 @@ function b_listfile_parse_entries(csv_content: string): ListfileEntry[] {
 			flags
 		});
 
-		string_offset += name_bytes.length;
+		string_offset += name_bytes.length + 1;
 	}
 
 	return entries;
@@ -222,7 +222,7 @@ async function b_listfile_write_files(target_dir: string, entries: ListfileEntry
 }
 
 async function b_listfile_write_strings(target_dir: string, entries: ListfileEntry[]): Promise<void> {
-	const total_size = entries.reduce((sum, e) => sum + e.name_bytes.length, 0);
+	const total_size = entries.reduce((sum, e) => sum + e.name_bytes.length + 1, 0);
 	const buffer = new ArrayBuffer(total_size);
 	const view = new Uint8Array(buffer);
 	let write_pos = 0;
@@ -230,6 +230,7 @@ async function b_listfile_write_strings(target_dir: string, entries: ListfileEnt
 	for (const entry of entries) {
 		view.set(entry.name_bytes, write_pos);
 		write_pos += entry.name_bytes.length;
+		view[write_pos++] = 0;
 	}
 
 	const file_path = path.join(target_dir, 'listfile-strings.dat');
