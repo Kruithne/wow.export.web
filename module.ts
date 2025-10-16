@@ -134,7 +134,7 @@ function b_listfile_parse_entries(csv_content: string): ListfileEntry[] {
 	const entries: ListfileEntry[] = [];
 	let string_offset = 0;
 
-	const lines = csv_content.split('\n');
+	const lines = csv_content.split(/\r?\n/);
 	for (const line of lines) {
 		if (line.length === 0)
 			continue;
