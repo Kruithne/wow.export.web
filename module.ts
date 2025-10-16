@@ -154,7 +154,7 @@ function b_listfile_parse_entries(csv_content: string): ListfileEntry[] {
 		for (const category of Object.values(LISTFILE_FLAGS)) {
 			for (const ext of category.extensions) {
 				if (filename.endsWith(ext)) {
-					// omit WMO group files from listfile
+					// omit WMO group files from the model group
 					if (category === LISTFILE_FLAGS.MODEL && ext === '.wmo' && LISTFILE_MODEL_FILTER.test(filename))
 						continue;
 
