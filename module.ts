@@ -8,13 +8,20 @@ import { ColorInput } from 'bun';
 const UPDATE_TIMER = 24 * 60 * 60 * 1000; // 24 hours
 const LISTFILE_HASH_THRESHOLD = 100;
 
-const LISTFILE_FLAGS = {
-	TEXTURE: { flag: 0x01, extensions: ['.blp'] },
-	SOUND: { flag: 0x02, extensions: ['.ogg', '.mp3', '.unk_sound'] },
-	MODEL: { flag: 0x04, extensions: ['.m2', '.m3', '.wmo'] },
-	VIDEO: { flag: 0x08, extensions: ['.avi'] },
-	TEXT: { flag: 0x10, extensions: ['.txt', '.lua', '.xml', '.sbt', '.wtf', '.htm', '.toc', '.xsd'] }
-} as const;
+const LISTFILE_TYPES = [
+	{ name: 'main', extensions: [] },
+	{ name: 'models', extensions: ['.m2', '.m3', '.wmo'] },
+	{ name: 'textures', extensions: ['.blp'] },
+	{ name: 'sounds', extensions: ['.ogg', '.mp3', '.unk_sound'] },
+	{ name: 'videos', extensions: ['.avi'] },
+	{ name: 'text', extensions: ['.txt', '.lua', '.xml', '.sbt', '.wtf', '.htm', '.toc', '.xsd'] }
+] as const;
+
+const LISTFILE_EXT: Record<string, number> = {};
+for (let i = 0; i < LISTFILE_TYPES.length; i++) {
+	for (const ext of LISTFILE_TYPES[i].extensions)
+		LISTFILE_EXT[ext] = i;
+}
 
 const LISTFILE_MODEL_FILTER = /_[0-9]{3}\.wmo$/;
 
@@ -106,7 +113,7 @@ interface ListfileEntry {
 	filename: string;
 	name_bytes: Uint8Array;
 	string_offset: number;
-	flags: number;
+	pf_index: number;
 }
 
 interface TreeNode {
@@ -130,9 +137,26 @@ async function b_listfile_build(target_dir: string): Promise<void> {
 	log('b_listfile_write_files :: done');
 }
 
+function b_listfile_categorize_entries(entries: ListfileEntry[]): ListfileEntry[][] {
+	const categorized: ListfileEntry[][] = Array.from({ length: LISTFILE_TYPES.length }, () => []);
+
+	for (const entry of entries) {
+		const ext = path.extname(entry.filename);
+		let pf_index = LISTFILE_EXT[ext] ?? 0;
+
+		// omit WMO group files from model category
+		if (pf_index === 1 && ext === '.wmo' && LISTFILE_MODEL_FILTER.test(entry.filename))
+			pf_index = 0;
+
+		entry.pf_index = pf_index;
+		categorized[pf_index].push(entry);
+	}
+
+	return categorized;
+}
+
 function b_listfile_parse_entries(csv_content: string): ListfileEntry[] {
 	const entries: ListfileEntry[] = [];
-	let string_offset = 0;
 
 	const lines = csv_content.split(/\r?\n/);
 	for (const line of lines) {
@@ -150,29 +174,13 @@ function b_listfile_parse_entries(csv_content: string): ListfileEntry[] {
 		const filename = tokens[1].trim().toLowerCase();
 		const name_bytes = new TextEncoder().encode(filename);
 
-		let flags = 0;
-		for (const category of Object.values(LISTFILE_FLAGS)) {
-			for (const ext of category.extensions) {
-				if (filename.endsWith(ext)) {
-					// omit WMO group files from the model group
-					if (category === LISTFILE_FLAGS.MODEL && ext === '.wmo' && LISTFILE_MODEL_FILTER.test(filename))
-						continue;
-
-					flags |= category.flag;
-					break;
-				}
-			}
-		}
-
 		entries.push({
 			id: file_data_id,
 			filename,
 			name_bytes,
-			string_offset,
-			flags
+			string_offset: 0,
+			pf_index: 0
 		});
-
-		string_offset += name_bytes.length + 1;
 	}
 
 	return entries;
@@ -216,31 +224,53 @@ function b_listfile_add_node(tree: Map<string, TreeNode>, file_path: string, fil
 }
 
 async function b_listfile_write_files(target_dir: string, entries: ListfileEntry[], tree: Map<string, TreeNode>): Promise<void> {
-	await b_listfile_write_strings(target_dir, entries);
+	await b_listfile_write_categorized_files(target_dir, entries);
 	await b_listfile_write_index(target_dir, entries);
 	await b_listfile_write_tree(target_dir, tree);
 }
 
-async function b_listfile_write_strings(target_dir: string, entries: ListfileEntry[]): Promise<void> {
-	const total_size = entries.reduce((sum, e) => sum + e.name_bytes.length + 1, 0);
-	const buffer = new ArrayBuffer(total_size);
-	const view = new Uint8Array(buffer);
-	let write_pos = 0;
+async function b_listfile_write_categorized_files(target_dir: string, entries: ListfileEntry[]): Promise<void> {
+	const categorized = b_listfile_categorize_entries(entries);
 
-	for (const entry of entries) {
-		view.set(entry.name_bytes, write_pos);
-		write_pos += entry.name_bytes.length;
-		view[write_pos++] = 0;
+	for (let pf_index = 0; pf_index < categorized.length; pf_index++) {
+		const category_entries = categorized[pf_index];
+		const sorted_entries = [...category_entries].sort((a, b) => a.id - b.id);
+
+		// calculate size: entry_count (4 bytes) + sum of (fileDataID (4 bytes) + filename + null terminator)
+		let total_size = 4; // entry_count
+		for (const entry of sorted_entries)
+			total_size += 4 + entry.name_bytes.length + 1;
+
+		const buffer = new ArrayBuffer(total_size);
+		const view = new DataView(buffer);
+		const bytes_view = new Uint8Array(buffer);
+
+		view.setUint32(0, sorted_entries.length, false);
+		let write_pos = 4;
+
+		for (const entry of sorted_entries) {
+			view.setUint32(write_pos, entry.id, false);
+			write_pos += 4;
+			entry.string_offset = write_pos;
+
+			bytes_view.set(entry.name_bytes, write_pos);
+			write_pos += entry.name_bytes.length;
+			bytes_view[write_pos++] = 0;
+		}
+
+		const type_name = LISTFILE_TYPES[pf_index].name;
+		const file_name = pf_index === 0 ? 'listfile-strings.dat' : `listfile-pf-${type_name}.dat`;
+		const file_path = path.join(target_dir, file_name);
+		await Bun.write(file_path, buffer);
+
+		log(`wrote {${file_name}} with {${sorted_entries.length}} entries`);
 	}
-
-	const file_path = path.join(target_dir, 'listfile-strings.dat');
-	await Bun.write(file_path, buffer);
 }
 
 async function b_listfile_write_index(target_dir: string, entries: ListfileEntry[]): Promise<void> {
 	const sorted_entries = [...entries].sort((a, b) => a.id - b.id);
 
-	// format: [id:4][stringOffset:4][flags:1] = 9 bytes per entry
+	// format: [id:4][stringOffset:4][pf_index:1] = 9 bytes per entry
 	const buffer = new ArrayBuffer(sorted_entries.length * 9);
 	const view = new DataView(buffer);
 	let index_pos = 0;
@@ -248,7 +278,7 @@ async function b_listfile_write_index(target_dir: string, entries: ListfileEntry
 	for (const entry of sorted_entries) {
 		view.setUint32(index_pos, entry.id, false);
 		view.setUint32(index_pos + 4, entry.string_offset, false);
-		view.setUint8(index_pos + 8, entry.flags);
+		view.setUint8(index_pos + 8, entry.pf_index);
 		index_pos += 9;
 	}
 
