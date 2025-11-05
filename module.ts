@@ -104,7 +104,6 @@ async function update_data_files() {
 }
 
 function schedule_update() {
-	update_listfile(); // todo: remove me.
 	setTimeout(update_data_files, UPDATE_TIMER);
 }
 
