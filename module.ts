@@ -403,13 +403,59 @@ function b_listfile_serialize_tree_node(node_map: Map<string, TreeNode>, node_da
 }
 
 async function update_listfile() {
-	const url = 'https://github.com/wowdev/wow-listfile/releases/latest/download/community-listfile.csv';
 	const target_dir = './wow.export/data/listfile';
+	const version_file = path.join(target_dir, 'version.json');
 
+	let should_update = false;
+	let remote_head: any = null;
+
+	try {
+		const version_res = await fetch('https://api.github.com/repos/wowdev/wow-listfile/git/refs/heads/master');
+		if (!version_res.ok) {
+			caution('Failed to check listfile version', { status: version_res.status });
+			return;
+		}
+
+		remote_head = await version_res.json();
+		const remote_sha = remote_head?.object?.sha;
+
+		if (!remote_sha) {
+			caution('Failed to parse listfile version', { remote_head });
+			return;
+		}
+
+		try {
+			const local_version = await Bun.file(version_file).json();
+			const local_sha = local_version?.object?.sha;
+
+			if (local_sha === remote_sha) {
+				log(`listfile is up to date ({${remote_sha.substring(0, 8)}})`);
+				return;
+			}
+
+			log(`listfile update available: {${local_sha?.substring(0, 8)}} -> {${remote_sha.substring(0, 8)}}`);
+			should_update = true;
+		} catch (e) {
+			// version.json doesn't exist or is invalid, proceed with update
+			log('no local listfile version found, proceeding with update');
+			should_update = true;
+		}
+	} catch (error) {
+		caution('Failed to check listfile version', [error instanceof Error ? error.message : String(error)]);
+		return;
+	}
+
+	if (!should_update)
+		return;
+
+	const url = 'https://github.com/wowdev/wow-listfile/releases/latest/download/community-listfile.csv';
 	await download_and_store(url, target_dir, 'master', 'listfile');
 
 	try {
 		await b_listfile_build(target_dir);
+
+		await Bun.write(version_file, JSON.stringify(remote_head, null, 2));
+		log(`saved listfile version to {${version_file}}`);
 	} catch (error) {
 		caution('Failed to build binary listfiles', [error instanceof Error ? error.message : String(error)]);
 	}
@@ -487,6 +533,7 @@ export async function init(server: SpooderServer) {
 	server.dir('/wow.export/download', './wow.export/download');
 
 	schedule_update();
+	update_listfile();
 
 	async function stream_to_file(url: string, file_path: string, name: string): Promise<void> {
 		const response = await fetch(url);
