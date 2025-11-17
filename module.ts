@@ -225,8 +225,8 @@ function b_listfile_add_node(tree: Map<string, TreeNode>, file_path: string, fil
 async function b_listfile_write_files(target_dir: string, entries: ListfileEntry[], tree: Map<string, TreeNode>): Promise<void> {
 	await b_listfile_write_categorized_files(target_dir, entries);
 	await b_listfile_write_index(target_dir, entries);
-	await b_listfile_write_full_index(target_dir, entries);
 	await b_listfile_write_tree(target_dir, tree);
+	await b_listfile_write_fat_files(target_dir, entries);
 }
 
 async function b_listfile_write_categorized_files(target_dir: string, entries: ListfileEntry[]): Promise<void> {
@@ -284,36 +284,6 @@ async function b_listfile_write_index(target_dir: string, entries: ListfileEntry
 
 	const file_path = path.join(target_dir, 'listfile-id-index.dat');
 	await Bun.write(file_path, buffer);
-}
-
-async function b_listfile_write_full_index(target_dir: string, entries: ListfileEntry[]): Promise<void> {
-	const sorted_entries = [...entries].sort((a, b) => a.id - b.id);
-
-	// calculate size: entry_count (4 bytes) + sum of (fileDataID (4 bytes) + filename + null terminator)
-	let total_size = 4; // entry_count
-	for (const entry of sorted_entries)
-		total_size += 4 + entry.name_bytes.length + 1;
-
-	const buffer = new ArrayBuffer(total_size);
-	const view = new DataView(buffer);
-	const bytes_view = new Uint8Array(buffer);
-
-	view.setUint32(0, sorted_entries.length, false);
-	let write_pos = 4;
-
-	for (const entry of sorted_entries) {
-		view.setUint32(write_pos, entry.id, false);
-		write_pos += 4;
-
-		bytes_view.set(entry.name_bytes, write_pos);
-		write_pos += entry.name_bytes.length;
-		bytes_view[write_pos++] = 0;
-	}
-
-	const file_path = path.join(target_dir, 'listfile-full-index.dat');
-	await Bun.write(file_path, buffer);
-
-	log(`wrote {listfile-full-index.dat} with {${sorted_entries.length}} entries (${(total_size / (1024 * 1024)).toFixed(2)} MB)`);
 }
 
 async function b_listfile_write_tree(target_dir: string, tree: Map<string, TreeNode>): Promise<void> {
@@ -431,6 +401,45 @@ function b_listfile_serialize_tree_node(node_map: Map<string, TreeNode>, node_da
 	}
 
 	return current_ofs;
+}
+
+async function b_listfile_write_fat_files(target_dir: string, entries: ListfileEntry[]): Promise<void> {
+	const sorted_entries = [...entries].sort((a, b) => a.id - b.id);
+
+	// fat strings file (no IDs, just concatenated null-terminated strings)
+	let total_size = 0;
+	for (const entry of sorted_entries)
+		total_size += entry.name_bytes.length + 1;
+
+	const strings_buffer = new ArrayBuffer(total_size);
+	const strings_view = new Uint8Array(strings_buffer);
+	let write_pos = 0;
+
+	for (const entry of sorted_entries) {
+		entry.string_offset = write_pos; // store offset for index
+		strings_view.set(entry.name_bytes, write_pos);
+		write_pos += entry.name_bytes.length;
+		strings_view[write_pos++] = 0;
+	}
+
+	const strings_path = path.join(target_dir, 'listfile-strings-fat.dat');
+	await Bun.write(strings_path, strings_buffer);
+	log(`wrote {listfile-strings-fat.dat} with {${sorted_entries.length}} entries`);
+
+	// fat index (no pf_index, just [id:4][stringOffset:4] = 8 bytes per entry)
+	const index_buffer = new ArrayBuffer(sorted_entries.length * 8);
+	const index_view = new DataView(index_buffer);
+	let index_pos = 0;
+
+	for (const entry of sorted_entries) {
+		index_view.setUint32(index_pos, entry.id, false);
+		index_view.setUint32(index_pos + 4, entry.string_offset, false);
+		index_pos += 8;
+	}
+
+	const index_path = path.join(target_dir, 'listfile-id-index-fat.dat');
+	await Bun.write(index_path, index_buffer);
+	log(`wrote {listfile-id-index-fat.dat} with {${sorted_entries.length}} entries`);
 }
 
 async function update_listfile() {
