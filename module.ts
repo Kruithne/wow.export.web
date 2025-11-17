@@ -225,6 +225,7 @@ function b_listfile_add_node(tree: Map<string, TreeNode>, file_path: string, fil
 async function b_listfile_write_files(target_dir: string, entries: ListfileEntry[], tree: Map<string, TreeNode>): Promise<void> {
 	await b_listfile_write_categorized_files(target_dir, entries);
 	await b_listfile_write_index(target_dir, entries);
+	await b_listfile_write_full_index(target_dir, entries);
 	await b_listfile_write_tree(target_dir, tree);
 }
 
@@ -283,6 +284,36 @@ async function b_listfile_write_index(target_dir: string, entries: ListfileEntry
 
 	const file_path = path.join(target_dir, 'listfile-id-index.dat');
 	await Bun.write(file_path, buffer);
+}
+
+async function b_listfile_write_full_index(target_dir: string, entries: ListfileEntry[]): Promise<void> {
+	const sorted_entries = [...entries].sort((a, b) => a.id - b.id);
+
+	// calculate size: entry_count (4 bytes) + sum of (fileDataID (4 bytes) + filename + null terminator)
+	let total_size = 4; // entry_count
+	for (const entry of sorted_entries)
+		total_size += 4 + entry.name_bytes.length + 1;
+
+	const buffer = new ArrayBuffer(total_size);
+	const view = new DataView(buffer);
+	const bytes_view = new Uint8Array(buffer);
+
+	view.setUint32(0, sorted_entries.length, false);
+	let write_pos = 4;
+
+	for (const entry of sorted_entries) {
+		view.setUint32(write_pos, entry.id, false);
+		write_pos += 4;
+
+		bytes_view.set(entry.name_bytes, write_pos);
+		write_pos += entry.name_bytes.length;
+		bytes_view[write_pos++] = 0;
+	}
+
+	const file_path = path.join(target_dir, 'listfile-full-index.dat');
+	await Bun.write(file_path, buffer);
+
+	log(`wrote {listfile-full-index.dat} with {${sorted_entries.length}} entries (${(total_size / (1024 * 1024)).toFixed(2)} MB)`);
 }
 
 async function b_listfile_write_tree(target_dir: string, tree: Map<string, TreeNode>): Promise<void> {
