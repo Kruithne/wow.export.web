@@ -23,7 +23,7 @@ for (let i = 0; i < LISTFILE_TYPES.length; i++) {
 		LISTFILE_EXT[ext] = i;
 }
 
-const LISTFILE_MODEL_FILTER = /_[0-9]{3}\.wmo$/;
+const LISTFILE_MODEL_FILTER = /(_\d\d\d_)|(_\d\d\d\.wmo$)|(lod\d\.wmo$)/;
 
 type SpooderServer = ReturnType<typeof http_serve>;
 
