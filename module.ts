@@ -5,7 +5,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ColorInput } from 'bun';
 
-const UPDATE_TIMER = 24 * 60 * 60 * 1000; // 24 hours
 const LISTFILE_HASH_THRESHOLD = 100;
 
 const LISTFILE_TYPES = [
@@ -94,17 +93,6 @@ async function download_and_store(url: string, target_dir: string, target_filena
 		if (temp_file)
 			await fs.unlink(temp_file);
 	}
-}
-
-async function update_data_files() {
-	await update_listfile();
-	await update_tact();
-
-	schedule_update();
-}
-
-function schedule_update() {
-	setTimeout(update_data_files, UPDATE_TIMER);
 }
 
 interface ListfileEntry {
@@ -572,9 +560,6 @@ export async function init(server: SpooderServer) {
 	server.dir('/wow.export/update', './wow.export/update');
 	server.dir('/wow.export/download', './wow.export/download');
 
-	schedule_update();
-	update_listfile();
-
 	async function stream_to_file(url: string, file_path: string, name: string): Promise<void> {
 		const response = await fetch(url);
 		if (!response.ok)
@@ -685,6 +670,33 @@ export async function init(server: SpooderServer) {
 		log(`queued trigger update for ${build_tag} (${trigger_update_queue.length} in queue)`);
 		process_trigger_update_queue();
 	}
+
+	let is_updating_listfile = false;
+	let is_updating_tact = false;
+
+	server.webhook(process.env.LISTFILE_WEBHOOK_SECRET!, '/wow.export/v2/trigger_listfile_rebuild', (payload) => {
+		setImmediate(async () => {
+			if (is_updating_listfile)
+				return;
+
+			is_updating_listfile = true;
+			await update_listfile();
+			is_updating_listfile = false;
+		});
+		return 200;
+	});
+
+	server.webhook(process.env.LISTFILE_WEBHOOK_SECRET!, '/wow.export/v2/trigger_tact_rebuild', (payload) => {
+		setImmediate(async () => {
+			if (is_updating_tact)
+				return;
+
+			is_updating_tact = true;
+			await update_tact();
+			is_updating_tact = false;
+		});
+		return 200;
+	});
 
 	server.json('/wow.export/v2/trigger_update/:build', async (req, url, json) => {
 		const key = req.headers.get('authorization');
