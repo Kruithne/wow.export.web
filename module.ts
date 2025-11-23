@@ -632,7 +632,10 @@ export async function init(server: SpooderServer) {
 			log(`downloading archive file from ${json.package_url}`);
 			const package_basename = path.basename(json.package_url);
 			const package_file_path = path.join(package_out_path, package_basename);
-			await stream_to_file(json.package_url, package_file_path, 'archive');
+
+			const tmp_package_path = package_out_path + package_basename + '.tmp';
+			await stream_to_file(json.package_url, tmp_package_path, 'archive');
+			await fs.rename(tmp_package_path, package_file_path);
 
 			// update release builds
 			log(`updating release build of {${build_tag}} to {${package_basename}}`);
