@@ -13,7 +13,7 @@ const LISTFILE_TYPES = [
 	{ name: 'textures', extensions: ['.blp'] },
 	{ name: 'sounds', extensions: ['.ogg', '.mp3', '.unk_sound'] },
 	{ name: 'videos', extensions: ['.avi'] },
-	{ name: 'text', extensions: ['.txt', '.lua', '.xml', '.sbt', '.wtf', '.htm', '.toc', '.xsd'] },
+	{ name: 'text', extensions: ['.txt', '.lua', '.xml', '.sbt', '.wtf', '.htm', '.toc', '.xsd', '.srt'] },
 	{ name: 'fonts', extensions: ['.ttf'] }
 ] as const;
 
