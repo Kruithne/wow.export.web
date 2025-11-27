@@ -678,15 +678,19 @@ export async function init(server: SpooderServer) {
 	let is_updating_listfile = false;
 	let is_updating_tact = false;
 
-	server.webhook(process.env.LISTFILE_WEBHOOK_SECRET!, '/wow.export/v2/trigger_listfile_rebuild', (payload) => {
-		setImmediate(async () => {
-			if (is_updating_listfile)
-				return;
+	async function trigger_listfile_update() {
+		if (is_updating_listfile)
+			return;
 
-			is_updating_listfile = true;
-			await update_listfile();
-			is_updating_listfile = false;
-		});
+		is_updating_listfile = true;
+		await update_listfile();
+		is_updating_listfile = false;
+	}
+
+	trigger_listfile_update(); // update listfile on server start
+
+	server.webhook(process.env.LISTFILE_WEBHOOK_SECRET!, '/wow.export/v2/trigger_listfile_rebuild', (payload) => {
+		setImmediate(trigger_listfile_update);
 		return 200;
 	});
 
