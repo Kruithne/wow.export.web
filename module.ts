@@ -1072,58 +1072,38 @@ export async function init(server: SpooderServer) {
 	});
 
 	// kino endpoint
-	server.route('/wow.export/v2/get_video', async (req) => {
-		const cors_headers = {
-			'Access-Control-Allow-Origin': '*',
-			'Access-Control-Allow-Methods': 'POST, OPTIONS',
-			'Access-Control-Allow-Headers': 'Content-Type, User-Agent'
-		};
-
-		if (req.method === 'OPTIONS')
-			return new Response(null, { status: 204, headers: cors_headers });
-
-		if (req.method !== 'POST')
-			return new Response(null, { status: 405, headers: cors_headers });
-
+	server.json('/wow.export/v2/get_video', async (req, url, json) => {
 		if (!req.headers.get('user-agent')?.startsWith('wow.export '))
-			return new Response(null, { status: 403, headers: cors_headers });
-
-		let json: any;
-		try {
-			json = await req.json();
-		} catch {
-			return new Response(null, { status: 400, headers: cors_headers });
-		}
+			return HTTP_STATUS_CODE.Forbidden_403;
 
 		const vid = json.vid;
 		if (!kino_is_valid_entry(vid))
-			return new Response(null, { status: 400, headers: cors_headers });
+			return HTTP_STATUS_CODE.BadRequest_400;
 
 		const aud = json.aud;
 		if (aud !== undefined && !kino_is_valid_entry(aud))
-			return new Response(null, { status: 400, headers: cors_headers });
+			return HTTP_STATUS_CODE.BadRequest_400;
 
 		const srt = json.srt;
 		if (srt !== undefined && !kino_is_valid_subtitle(srt))
-			return new Response(null, { status: 400, headers: cors_headers });
+			return HTTP_STATUS_CODE.BadRequest_400;
 
 		// check if already cached
 		const cached = await db`SELECT 1 AS cached FROM kino_cached WHERE enc = ${vid.enc}`;
 		if (cached.length) {
-			return new Response(JSON.stringify({ url: kino_bucket.presign(vid.enc) }), {
-				status: 200,
-				headers: { ...cors_headers, 'Content-Type': 'application/json' }
-			});
+			return {
+				url: kino_bucket.presign(vid.enc)
+			};
 		}
 
 		// check if already queued or processing
 		if (kino_queue.has(vid.enc) || kino_processing === vid.enc)
-			return new Response(null, { status: 202, headers: cors_headers });
+			return HTTP_STATUS_CODE.Accepted_202;
 
 		// add to queue and trigger processing
 		kino_queue.set(vid.enc, { vid, aud, srt });
 		setImmediate(kino_process_queue);
 
-		return new Response(null, { status: 202, headers: cors_headers });
+		return HTTP_STATUS_CODE.Accepted_202;
 	});
 }
