@@ -1,9 +1,14 @@
-import { http_serve, caution, parse_template, HTTP_STATUS_CODE } from 'spooder';
+import { http_serve, caution, parse_template, HTTP_STATUS_CODE, ErrorWithMetadata } from 'spooder';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { ColorInput } from 'bun';
+import { db } from './db';
+import { blte_unpack } from './casc/blte';
+import { tact_load_keys } from './casc/tact';
+import { bucket } from './obj_rds';
 
 const LISTFILE_HASH_THRESHOLD = 100;
 
@@ -32,6 +37,244 @@ function log(message: string, color: ColorInput = 'orange'): void {
 	const ansi = Bun.color(color, 'ansi-256');
 	process.stdout.write(`[{wow.export}] > ${message}\n`.replace(/\{([^}]+)\}/g, `${ansi}$1${ANSI_RESET}`));
 }
+
+// region kino
+const kino_bucket = bucket('wow.export.kino', process.env.KINO_CDN_SECRET!);
+
+type Hash = string; // 32-char hex
+
+type ArchiveRef = { key: Hash; ofs: number; len: number };
+type Media = { enc: Hash; arc?: ArchiveRef };
+type Subtitle = Media & { type: number };
+
+function kino_is_valid_hash(str: string): boolean {
+	return /^[a-f0-9]{32}$/.test(str);
+}
+
+function kino_is_valid_archive_ref(obj: any): obj is ArchiveRef {
+	return (
+		typeof obj === 'object' &&
+		obj !== null &&
+		'key' in obj &&
+		'ofs' in obj &&
+		'len' in obj &&
+		typeof obj.key === 'string' &&
+		kino_is_valid_hash(obj.key) &&
+		Number.isInteger(obj.ofs) &&
+		Number.isInteger(obj.len) &&
+		obj.ofs >= 0 &&
+		obj.len >= 0 &&
+		Object.keys(obj).length === 3
+	);
+}
+
+function kino_is_valid_entry(obj: any): obj is Media {
+	if (typeof obj !== 'object' || obj === null)
+		return false;
+
+	if (!('enc' in obj) || typeof obj.enc !== 'string' || !kino_is_valid_hash(obj.enc))
+		return false;
+
+	if ('arc' in obj) {
+		if (!kino_is_valid_archive_ref(obj.arc))
+			return false;
+		return Object.keys(obj).length === 2;
+	}
+
+	return Object.keys(obj).length === 1;
+}
+
+function kino_is_valid_subtitle(obj: any): obj is Subtitle {
+	if (typeof obj !== 'object' || obj === null)
+		return false;
+
+	if (!('enc' in obj) || typeof obj.enc !== 'string' || !kino_is_valid_hash(obj.enc))
+		return false;
+
+	if (!('type' in obj) || !Number.isInteger(obj.type))
+		return false;
+
+	if ('arc' in obj) {
+		if (!kino_is_valid_archive_ref(obj.arc))
+			return false;
+		return Object.keys(obj).length === 3;
+	}
+
+	return Object.keys(obj).length === 2;
+}
+
+// casc cdn
+const CASC_VERSION_URL = (region: string) => process.env.VERSION_URL!.replace('%s', region);
+const CASC_CDN_REGIONS = process.env.CDN_REGIONS!.split(',');
+const CASC_PRODUCT = 'wow';
+
+type CASCCDNServerEntry = {
+	Name: string;
+	Path: string;
+	Hosts: string;
+};
+
+type CASCVersionEntry = {
+	Region: string;
+};
+
+let casc_cdn_hosts: string[] = [];
+let casc_cdn_path: string = '';
+let casc_ready: Promise<void> | null = null;
+
+function casc_url_join(...parts: string[]): string {
+	return parts.join('/').replace(/(?<!:)\/\/+/g, '/');
+}
+
+function casc_format_key(key: string): string {
+	return `${key.substring(0, 2)}/${key.substring(2, 4)}/${key}`;
+}
+
+function casc_parse_version_config<T>(data: string): T[] {
+	const entries: T[] = [];
+	const lines = data.split(/\r?\n/);
+
+	const headerLine = lines.shift();
+	if (headerLine === undefined)
+		return entries;
+
+	const headers = headerLine.split('|');
+	const fields = new Array(headers.length);
+
+	for (let i = 0, n = headers.length; i < n; i++)
+		fields[i] = headers[i]!.split('!')[0]!.replace(' ', '');
+
+	for (const entry of lines) {
+		if (entry.trim().length === 0 || entry.startsWith('#'))
+			continue;
+
+		const node: Record<string, string> = {};
+		const entryFields = entry.split('|');
+		for (let i = 0, n = entryFields.length; i < n; i++)
+			node[fields[i]!] = entryFields[i]!;
+
+		entries.push(node as T);
+	}
+
+	return entries;
+}
+
+async function casc_detect_version_server(): Promise<{ tag: string; url: string }> {
+	const promises = CASC_CDN_REGIONS.map(tag => {
+		const url = CASC_VERSION_URL(tag);
+		return fetch(url).then(() => ({ tag, url }));
+	});
+
+	return await Promise.any(promises);
+}
+
+async function casc_init(): Promise<void> {
+	log('initializing {casc} CDN client');
+
+	const tact_promise = tact_load_keys();
+
+	const version_server = await casc_detect_version_server();
+	log(`casc using {${version_server.tag}} version server`);
+
+	const product_url = casc_url_join(version_server.url, CASC_PRODUCT);
+
+	const [cdns_res, versions_res] = await Promise.all([
+		fetch(casc_url_join(product_url, 'cdns')),
+		fetch(casc_url_join(product_url, 'versions'))
+	]);
+
+	if (!cdns_res.ok)
+		throw new ErrorWithMetadata('casc: failed to fetch CDN servers', { status: cdns_res.status });
+
+	if (!versions_res.ok)
+		throw new ErrorWithMetadata('casc: failed to fetch versions', { status: versions_res.status });
+
+	const cdn_servers = casc_parse_version_config<CASCCDNServerEntry>(await cdns_res.text());
+	const versions = casc_parse_version_config<CASCVersionEntry>(await versions_res.text());
+
+	const cdn_config = cdn_servers.find(e => e.Name === version_server.tag);
+	if (!cdn_config)
+		throw new ErrorWithMetadata('casc: CDN config missing for region', { region: version_server.tag });
+
+	const version = versions.find(e => e.Region === version_server.tag);
+	if (!version)
+		throw new ErrorWithMetadata('casc: version missing for region', { region: version_server.tag });
+
+	casc_cdn_path = cdn_config.Path;
+
+	// ping hosts to find fastest
+	const hosts = cdn_config.Hosts.split(' ');
+	log(`casc pinging {${hosts.length}} CDN hosts`);
+
+	const ping_results = await Promise.all(hosts.map(async host => {
+		const url = `https://${host}`;
+		const start = performance.now();
+
+		try {
+			await fetch(url, { method: 'HEAD' });
+			return { host, time: performance.now() - start };
+		} catch {
+			return null;
+		}
+	}));
+
+	const valid_hosts = ping_results.filter((r): r is { host: string; time: number } => r !== null);
+	if (valid_hosts.length === 0)
+		throw new ErrorWithMetadata('casc: all CDN hosts failed ping', { hosts });
+
+	valid_hosts.sort((a, b) => a.time - b.time);
+	casc_cdn_hosts = valid_hosts.map(r => r.host);
+
+	log(`casc CDN host priority: {${casc_cdn_hosts.join(', ')}}`);
+
+	await tact_promise;
+	log('casc CDN client {ready}');
+}
+
+async function casc_download(path: string, offset?: number, length?: number): Promise<Response> {
+	const failed_hosts: string[] = [];
+
+	for (const host of casc_cdn_hosts) {
+		const url = casc_url_join(`https://${host}`, path);
+
+		try {
+			const headers: Record<string, string> = {};
+			if (offset !== undefined && length !== undefined)
+				headers.Range = `bytes=${offset}-${offset + length - 1}`;
+
+			const res = await fetch(url, { headers });
+
+			if (res.ok) {
+				// re-order to deprioritize failed hosts
+				if (failed_hosts.length > 0) {
+					casc_cdn_hosts = casc_cdn_hosts.filter(h => !failed_hosts.includes(h));
+					casc_cdn_hosts.push(...failed_hosts);
+				}
+				return res;
+			}
+
+			failed_hosts.push(host);
+		} catch {
+			failed_hosts.push(host);
+		}
+	}
+
+	throw new ErrorWithMetadata('casc: all CDN hosts failed', { path, failed_hosts });
+}
+
+async function casc_download_data(key: string, offset?: number, length?: number): Promise<Response> {
+	return casc_download(casc_url_join(casc_cdn_path, 'data', casc_format_key(key)), offset, length);
+}
+
+async function casc_get_file(media: Media): Promise<ArrayBuffer> {
+	const res = media.arc
+		? await casc_download_data(media.arc.key, media.arc.ofs, media.arc.len)
+		: await casc_download_data(media.enc);
+
+	const data = await res.arrayBuffer();
+	return blte_unpack(data, media.enc, false);
+}
+// endregion
 
 async function download_and_store(url: string, target_dir: string, target_filename: string, name: string) {
 	const target_file = path.join(target_dir, target_filename);
@@ -519,6 +762,8 @@ export async function init(server: SpooderServer) {
 		log(`failed to load RELEASE_BUILD_FILE ${RELEASE_BUILD_FILE}: ${(e as Error).message}`);
 	}
 
+	casc_ready = casc_init();
+
 	server.route('/wow.export', async (req) => {
 		if (index === null) {
 			index = await Bun.file('./wow.export/index.html').text();
@@ -722,5 +967,107 @@ export async function init(server: SpooderServer) {
 
 		trigger_update(build_tag, json);
 		return HTTP_STATUS_CODE.Accepted_202;
+	});
+
+	// kino endpoint
+	server.json('/wow.export/v2/get_video', async (req, url, json) => {
+		if (!req.headers.get('user-agent')?.startsWith('wow.export '))
+			return HTTP_STATUS_CODE.Forbidden_403;
+
+		const vid = json.vid;
+		if (!kino_is_valid_entry(vid))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		const aud = json.aud;
+		if (aud !== undefined && !kino_is_valid_entry(aud))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		const srt = json.srt;
+		if (srt !== undefined && !kino_is_valid_subtitle(srt))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		const cached = await db`SELECT 1 AS cached FROM kino_cached WHERE enc = ${vid.enc}`;
+
+		if (!cached.length) {
+			const temp_dir = path.join(os.tmpdir(), `kino_${vid.enc}`);
+
+			try {
+				await fs.mkdir(temp_dir, { recursive: true });
+
+				await casc_ready;
+
+				const video_path = path.join(temp_dir, vid.enc);
+				const video_data = await casc_get_file(vid);
+				await Bun.write(video_path, video_data);
+
+				let audio_path: string | undefined;
+				if (aud !== undefined) {
+					audio_path = path.join(temp_dir, aud.enc);
+					const audio_data = await casc_get_file(aud);
+					await Bun.write(audio_path, audio_data);
+				}
+
+				let srt_path: string | undefined;
+				if (srt !== undefined && srt.type === 118) {
+					srt_path = path.join(temp_dir, srt.enc);
+					const srt_data = await casc_get_file(srt);
+					await Bun.write(srt_path, srt_data);
+				}
+
+				const output_path = path.join(temp_dir, `${vid.enc}.mp4`);
+				const ffmpeg_args: string[] = ['-i', video_path];
+
+				if (audio_path !== undefined)
+					ffmpeg_args.push('-i', audio_path);
+
+				if (srt_path !== undefined)
+					ffmpeg_args.push('-i', srt_path);
+
+				ffmpeg_args.push('-c:v', 'copy');
+
+				if (audio_path !== undefined)
+					ffmpeg_args.push('-c:a', 'aac');
+
+				if (srt_path !== undefined)
+					ffmpeg_args.push('-c:s', 'mov_text');
+
+				if (audio_path !== undefined)
+					ffmpeg_args.push('-shortest');
+
+				ffmpeg_args.push(output_path);
+
+				await new Promise<void>((resolve, reject) => {
+					const ffmpeg = spawn('ffmpeg', ffmpeg_args);
+
+					ffmpeg.on('close', (code) => {
+						if (code === 0)
+							resolve();
+						else
+							reject(new Error(`ffmpeg exited with code ${code}`));
+					});
+
+					ffmpeg.on('error', reject);
+				});
+
+				const upload_result = await kino_bucket.upload(Bun.file(output_path), {
+					object_id: vid.enc,
+					content_type: 'video/mp4'
+				});
+
+				if (upload_result === null)
+					throw new Error('failed to upload to CDN');
+
+				await db`INSERT INTO kino_cached (enc) VALUES (${vid.enc})`;
+			} catch (e) {
+				caution('kino: failed to process video', { error: e, vid, aud, srt });
+				return HTTP_STATUS_CODE.InternalServerError_500;
+			} finally {
+				await fs.rm(temp_dir, { recursive: true, force: true });
+			}
+		}
+
+		return {
+			url: kino_bucket.presign(vid.enc)
+		};
 	});
 }
