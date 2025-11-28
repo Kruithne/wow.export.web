@@ -1071,7 +1071,22 @@ export async function init(server: SpooderServer) {
 		return HTTP_STATUS_CODE.Accepted_202;
 	});
 
-	// kino endpoint
+	// kino endpoint - CORS preflight
+	server.route('/wow.export/v2/get_video', async (req) => {
+		if (req.method !== 'OPTIONS')
+			return null;
+
+		return new Response(null, {
+			status: 204,
+			headers: {
+				'Access-Control-Allow-Origin': '*',
+				'Access-Control-Allow-Methods': 'POST, OPTIONS',
+				'Access-Control-Allow-Headers': 'Content-Type, User-Agent'
+			}
+		});
+	});
+
+	// kino endpoint - POST handler
 	server.json('/wow.export/v2/get_video', async (req, url, json) => {
 		if (!req.headers.get('user-agent')?.startsWith('wow.export '))
 			return HTTP_STATUS_CODE.Forbidden_403;
