@@ -1071,54 +1071,59 @@ export async function init(server: SpooderServer) {
 		return HTTP_STATUS_CODE.Accepted_202;
 	});
 
-	// kino endpoint - CORS preflight
+	// kino endpoint
 	server.route('/wow.export/v2/get_video', async (req) => {
-		if (req.method !== 'OPTIONS')
-			return null;
+		const cors_headers = {
+			'Access-Control-Allow-Origin': '*',
+			'Access-Control-Allow-Methods': 'POST, OPTIONS',
+			'Access-Control-Allow-Headers': 'Content-Type, User-Agent'
+		};
 
-		return new Response(null, {
-			status: 204,
-			headers: {
-				'Access-Control-Allow-Origin': '*',
-				'Access-Control-Allow-Methods': 'POST, OPTIONS',
-				'Access-Control-Allow-Headers': 'Content-Type, User-Agent'
-			}
-		});
-	});
+		if (req.method === 'OPTIONS')
+			return new Response(null, { status: 204, headers: cors_headers });
 
-	// kino endpoint - POST handler
-	server.json('/wow.export/v2/get_video', async (req, url, json) => {
+		if (req.method !== 'POST')
+			return new Response(null, { status: 405, headers: cors_headers });
+
 		if (!req.headers.get('user-agent')?.startsWith('wow.export '))
-			return HTTP_STATUS_CODE.Forbidden_403;
+			return new Response(null, { status: 403, headers: cors_headers });
+
+		let json: any;
+		try {
+			json = await req.json();
+		} catch {
+			return new Response(null, { status: 400, headers: cors_headers });
+		}
 
 		const vid = json.vid;
 		if (!kino_is_valid_entry(vid))
-			return HTTP_STATUS_CODE.BadRequest_400;
+			return new Response(null, { status: 400, headers: cors_headers });
 
 		const aud = json.aud;
 		if (aud !== undefined && !kino_is_valid_entry(aud))
-			return HTTP_STATUS_CODE.BadRequest_400;
+			return new Response(null, { status: 400, headers: cors_headers });
 
 		const srt = json.srt;
 		if (srt !== undefined && !kino_is_valid_subtitle(srt))
-			return HTTP_STATUS_CODE.BadRequest_400;
+			return new Response(null, { status: 400, headers: cors_headers });
 
 		// check if already cached
 		const cached = await db`SELECT 1 AS cached FROM kino_cached WHERE enc = ${vid.enc}`;
 		if (cached.length) {
-			return {
-				url: kino_bucket.presign(vid.enc)
-			};
+			return new Response(JSON.stringify({ url: kino_bucket.presign(vid.enc) }), {
+				status: 200,
+				headers: { ...cors_headers, 'Content-Type': 'application/json' }
+			});
 		}
 
 		// check if already queued or processing
 		if (kino_queue.has(vid.enc) || kino_processing === vid.enc)
-			return HTTP_STATUS_CODE.Accepted_202;
+			return new Response(null, { status: 202, headers: cors_headers });
 
 		// add to queue and trigger processing
 		kino_queue.set(vid.enc, { vid, aud, srt });
 		setImmediate(kino_process_queue);
 
-		return HTTP_STATUS_CODE.Accepted_202;
+		return new Response(null, { status: 202, headers: cors_headers });
 	});
 }
