@@ -1,4 +1,4 @@
 CREATE TABLE kv_store (
-	`key` VARCHAR(255) PRIMARY KEY,
-	`value` TEXT
+	kv_key VARCHAR(255) PRIMARY KEY,
+	kv_value TEXT
 );
