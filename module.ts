@@ -47,6 +47,15 @@ type ArchiveRef = { key: Hash; ofs: number; len: number };
 type Media = { enc: Hash; arc?: ArchiveRef };
 type Subtitle = Media & { type: number };
 
+type KinoQueueEntry = {
+	vid: Media;
+	aud?: Media;
+	srt?: Subtitle;
+};
+
+const kino_queue = new Map<Hash, KinoQueueEntry>();
+let kino_processing: Hash | null = null;
+
 function kino_is_valid_hash(str: string): boolean {
 	return /^[a-f0-9]{32}$/.test(str);
 }
@@ -273,6 +282,99 @@ async function casc_get_file(media: Media): Promise<ArrayBuffer> {
 
 	const data = await res.arrayBuffer();
 	return blte_unpack(data, media.enc, false);
+}
+
+async function kino_process_video(entry: KinoQueueEntry): Promise<void> {
+	const { vid, aud, srt } = entry;
+	const temp_dir = path.join(os.tmpdir(), `kino_${vid.enc}`);
+
+	try {
+		await casc_ready;
+		await fs.mkdir(temp_dir, { recursive: true });
+
+		const video_path = path.join(temp_dir, vid.enc);
+		const video_data = await casc_get_file(vid);
+		await Bun.write(video_path, video_data);
+
+		let audio_path: string | undefined;
+		if (aud !== undefined) {
+			audio_path = path.join(temp_dir, aud.enc);
+			const audio_data = await casc_get_file(aud);
+			await Bun.write(audio_path, audio_data);
+		}
+
+		let srt_path: string | undefined;
+		if (srt !== undefined && srt.type === 118) {
+			srt_path = path.join(temp_dir, srt.enc);
+			const srt_data = await casc_get_file(srt);
+			await Bun.write(srt_path, srt_data);
+		}
+
+		const output_path = path.join(temp_dir, `${vid.enc}.mp4`);
+		const ffmpeg_args: string[] = ['-i', video_path];
+
+		if (audio_path !== undefined)
+			ffmpeg_args.push('-i', audio_path);
+
+		if (srt_path !== undefined)
+			ffmpeg_args.push('-i', srt_path);
+
+		ffmpeg_args.push('-c:v', 'copy');
+
+		if (audio_path !== undefined)
+			ffmpeg_args.push('-c:a', 'aac');
+
+		if (srt_path !== undefined)
+			ffmpeg_args.push('-c:s', 'mov_text');
+
+		if (audio_path !== undefined)
+			ffmpeg_args.push('-shortest');
+
+		ffmpeg_args.push(output_path);
+
+		await new Promise<void>((resolve, reject) => {
+			const ffmpeg = spawn('ffmpeg', ffmpeg_args);
+
+			ffmpeg.on('close', (code) => {
+				if (code === 0)
+					resolve();
+				else
+					reject(new Error(`ffmpeg exited with code ${code}`));
+			});
+
+			ffmpeg.on('error', reject);
+		});
+
+		const upload_result = await kino_bucket.upload(Bun.file(output_path), {
+			object_id: vid.enc,
+			content_type: 'video/mp4'
+		});
+
+		if (upload_result === null)
+			throw new Error('failed to upload to CDN');
+
+		await db`INSERT INTO kino_cached (enc) VALUES (${vid.enc})`;
+	} catch (e) {
+		caution('kino: failed to process video', { error: e, vid, aud, srt });
+	} finally {
+		await fs.rm(temp_dir, { recursive: true, force: true });
+	}
+}
+
+async function kino_process_queue(): Promise<void> {
+	if (kino_processing !== null || kino_queue.size === 0)
+		return;
+
+	while (kino_queue.size > 0) {
+		const [enc, entry] = kino_queue.entries().next().value!;
+		kino_queue.delete(enc);
+		kino_processing = enc;
+
+		log(`kino processing {${enc}} (${kino_queue.size} remaining in queue)`);
+		await kino_process_video(entry);
+	}
+
+	kino_processing = null;
 }
 // endregion
 
@@ -986,88 +1088,22 @@ export async function init(server: SpooderServer) {
 		if (srt !== undefined && !kino_is_valid_subtitle(srt))
 			return HTTP_STATUS_CODE.BadRequest_400;
 
+		// check if already cached
 		const cached = await db`SELECT 1 AS cached FROM kino_cached WHERE enc = ${vid.enc}`;
-
-		if (!cached.length) {
-			const temp_dir = path.join(os.tmpdir(), `kino_${vid.enc}`);
-
-			try {
-				await fs.mkdir(temp_dir, { recursive: true });
-
-				await casc_ready;
-
-				const video_path = path.join(temp_dir, vid.enc);
-				const video_data = await casc_get_file(vid);
-				await Bun.write(video_path, video_data);
-
-				let audio_path: string | undefined;
-				if (aud !== undefined) {
-					audio_path = path.join(temp_dir, aud.enc);
-					const audio_data = await casc_get_file(aud);
-					await Bun.write(audio_path, audio_data);
-				}
-
-				let srt_path: string | undefined;
-				if (srt !== undefined && srt.type === 118) {
-					srt_path = path.join(temp_dir, srt.enc);
-					const srt_data = await casc_get_file(srt);
-					await Bun.write(srt_path, srt_data);
-				}
-
-				const output_path = path.join(temp_dir, `${vid.enc}.mp4`);
-				const ffmpeg_args: string[] = ['-i', video_path];
-
-				if (audio_path !== undefined)
-					ffmpeg_args.push('-i', audio_path);
-
-				if (srt_path !== undefined)
-					ffmpeg_args.push('-i', srt_path);
-
-				ffmpeg_args.push('-c:v', 'copy');
-
-				if (audio_path !== undefined)
-					ffmpeg_args.push('-c:a', 'aac');
-
-				if (srt_path !== undefined)
-					ffmpeg_args.push('-c:s', 'mov_text');
-
-				if (audio_path !== undefined)
-					ffmpeg_args.push('-shortest');
-
-				ffmpeg_args.push(output_path);
-
-				await new Promise<void>((resolve, reject) => {
-					const ffmpeg = spawn('ffmpeg', ffmpeg_args);
-
-					ffmpeg.on('close', (code) => {
-						if (code === 0)
-							resolve();
-						else
-							reject(new Error(`ffmpeg exited with code ${code}`));
-					});
-
-					ffmpeg.on('error', reject);
-				});
-
-				const upload_result = await kino_bucket.upload(Bun.file(output_path), {
-					object_id: vid.enc,
-					content_type: 'video/mp4'
-				});
-
-				if (upload_result === null)
-					throw new Error('failed to upload to CDN');
-
-				await db`INSERT INTO kino_cached (enc) VALUES (${vid.enc})`;
-			} catch (e) {
-				caution('kino: failed to process video', { error: e, vid, aud, srt });
-				return HTTP_STATUS_CODE.InternalServerError_500;
-			} finally {
-				await fs.rm(temp_dir, { recursive: true, force: true });
-			}
+		if (cached.length) {
+			return {
+				url: kino_bucket.presign(vid.enc)
+			};
 		}
 
-		return {
-			url: kino_bucket.presign(vid.enc)
-		};
+		// check if already queued or processing
+		if (kino_queue.has(vid.enc) || kino_processing === vid.enc)
+			return HTTP_STATUS_CODE.Accepted_202;
+
+		// add to queue and trigger processing
+		kino_queue.set(vid.enc, { vid, aud, srt });
+		setImmediate(kino_process_queue);
+
+		return HTTP_STATUS_CODE.Accepted_202;
 	});
 }
