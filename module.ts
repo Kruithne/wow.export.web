@@ -60,6 +60,11 @@ function kino_is_valid_hash(str: string): boolean {
 	return /^[a-f0-9]{32}$/.test(str);
 }
 
+function kino_cache_key(vid: Media, aud?: Media, srt?: Subtitle): string {
+	const composite = vid.enc + (aud?.enc ?? '') + (srt?.enc ?? '');
+	return crypto.createHash('md5').update(composite).digest('hex');
+}
+
 function kino_is_valid_archive_ref(obj: any): obj is ArchiveRef {
 	return (
 		typeof obj === 'object' &&
@@ -284,9 +289,9 @@ async function casc_get_file(media: Media): Promise<ArrayBuffer> {
 	return blte_unpack(data, media.enc, false);
 }
 
-async function kino_process_video(entry: KinoQueueEntry): Promise<void> {
+async function kino_process_video(entry: KinoQueueEntry, cache_key: string): Promise<void> {
 	const { vid, aud, srt } = entry;
-	const temp_dir = path.join(os.tmpdir(), `kino_${vid.enc}`);
+	const temp_dir = path.join(os.tmpdir(), `kino_${cache_key}`);
 
 	try {
 		await casc_ready;
@@ -310,7 +315,7 @@ async function kino_process_video(entry: KinoQueueEntry): Promise<void> {
 			await Bun.write(srt_path, srt_data);
 		}
 
-		const output_path = path.join(temp_dir, `${vid.enc}.mp4`);
+		const output_path = path.join(temp_dir, `${cache_key}.mp4`);
 		const ffmpeg_args: string[] = ['-i', video_path];
 
 		if (audio_path !== undefined)
@@ -346,14 +351,14 @@ async function kino_process_video(entry: KinoQueueEntry): Promise<void> {
 		});
 
 		const upload_result = await kino_bucket.upload(Bun.file(output_path), {
-			object_id: vid.enc,
+			object_id: cache_key,
 			content_type: 'video/mp4'
 		});
 
 		if (upload_result === null)
 			throw new Error('failed to upload to CDN');
 
-		await db`INSERT INTO kino_cached (enc) VALUES (${vid.enc})`;
+		await db`INSERT INTO kino_cached (enc) VALUES (${cache_key})`;
 	} catch (e) {
 		caution('kino: failed to process video', { error: e, vid, aud, srt });
 	} finally {
@@ -366,12 +371,12 @@ async function kino_process_queue(): Promise<void> {
 		return;
 
 	while (kino_queue.size > 0) {
-		const [enc, entry] = kino_queue.entries().next().value!;
-		kino_queue.delete(enc);
-		kino_processing = enc;
+		const [cache_key, entry] = kino_queue.entries().next().value!;
+		kino_queue.delete(cache_key);
+		kino_processing = cache_key;
 
-		log(`kino processing {${enc}} (${kino_queue.size} remaining in queue)`);
-		await kino_process_video(entry);
+		log(`kino processing {${cache_key}} (${kino_queue.size} remaining in queue)`);
+		await kino_process_video(entry, cache_key);
 	}
 
 	kino_processing = null;
@@ -1088,20 +1093,22 @@ export async function init(server: SpooderServer) {
 		if (srt !== undefined && !kino_is_valid_subtitle(srt))
 			return HTTP_STATUS_CODE.BadRequest_400;
 
+		const cache_key = kino_cache_key(vid, aud, srt);
+
 		// check if already cached
-		const cached = await db`SELECT 1 AS cached FROM kino_cached WHERE enc = ${vid.enc}`;
+		const cached = await db`SELECT 1 AS cached FROM kino_cached WHERE enc = ${cache_key}`;
 		if (cached.length) {
 			return {
-				url: kino_bucket.presign(vid.enc)
+				url: kino_bucket.presign(cache_key)
 			};
 		}
 
 		// check if already queued or processing
-		if (kino_queue.has(vid.enc) || kino_processing === vid.enc)
+		if (kino_queue.has(cache_key) || kino_processing === cache_key)
 			return HTTP_STATUS_CODE.Accepted_202;
 
 		// add to queue and trigger processing
-		kino_queue.set(vid.enc, { vid, aud, srt });
+		kino_queue.set(cache_key, { vid, aud, srt });
 		setImmediate(kino_process_queue);
 
 		return HTTP_STATUS_CODE.Accepted_202;
