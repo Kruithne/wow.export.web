@@ -322,7 +322,7 @@ async function kino_process_video(entry: KinoQueueEntry): Promise<void> {
 		ffmpeg_args.push('-c:v', 'copy');
 
 		if (audio_path !== undefined)
-			ffmpeg_args.push('-c:a', 'aac');
+			ffmpeg_args.push('-c:a', 'libopus', '-b:a', '128k');
 
 		if (srt_path !== undefined)
 			ffmpeg_args.push('-c:s', 'mov_text');
