@@ -9,6 +9,7 @@ import { db } from './db';
 import { blte_unpack } from './casc/blte';
 import { tact_load_keys } from './casc/tact';
 import { bucket } from './obj_rds';
+import { sbt_to_srt } from './subtitles';
 
 const LISTFILE_HASH_THRESHOLD = 100;
 
@@ -309,10 +310,17 @@ async function kino_process_video(entry: KinoQueueEntry, cache_key: string): Pro
 		}
 
 		let srt_path: string | undefined;
-		if (srt !== undefined && srt.type === 118) {
-			srt_path = path.join(temp_dir, srt.enc);
+		if (srt !== undefined && (srt.type === 118 || srt.type === 7)) {
+			srt_path = path.join(temp_dir, `${srt.enc}.srt`);
 			const srt_data = await casc_get_file(srt);
-			await Bun.write(srt_path, srt_data);
+
+			if (srt.type === 7) {
+				const sbt_text = new TextDecoder().decode(srt_data);
+				const converted = sbt_to_srt(sbt_text);
+				await Bun.write(srt_path, converted);
+			} else {
+				await Bun.write(srt_path, srt_data);
+			}
 		}
 
 		const output_path = path.join(temp_dir, `${cache_key}.mp4`);
