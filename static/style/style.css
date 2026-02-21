@@ -138,6 +138,21 @@ body {
 	flex-wrap: wrap;
 }
 
+.download-group {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+}
+
+#intro-right .portable-link {
+	font-size: 0.85em;
+	color: var(--color-font-faded);
+	margin-top: 5px;
+	background: none;
+	padding: 0;
+	box-shadow: none;
+}
+
 #intro-right a {
 	background-repeat: no-repeat;
 	background-position: 10px;

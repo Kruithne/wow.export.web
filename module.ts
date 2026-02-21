@@ -1001,6 +1001,10 @@ export async function init(server: SpooderServer) {
 			// update release builds
 			log(`updating release build of {${build_tag}} to {${package_basename}}`);
 			release_builds[build_tag] = package_basename;
+
+			if (typeof json.portable_url === 'string')
+				release_builds['portable-' + build_tag] = json.portable_url;
+
 			index = null; // force index re-render
 
 			await Bun.write(RELEASE_BUILD_FILE, JSON.stringify(release_builds));

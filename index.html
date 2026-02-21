@@ -41,13 +41,28 @@
 			</div>
 			<div id="intro-right">
 				<t-if test="win-x64">
-					<a href="https://www.kruithne.net/wow.export/download/win-x64/{{ win-x64 }}" id="intro-button-windows">Download for Windows</a>
+					<div class="download-group">
+						<a href="https://www.kruithne.net/wow.export/download/win-x64/{{ win-x64 }}" id="intro-button-windows">Download for Windows</a>
+						<t-if test="portable-win-x64">
+							<a href="{{ portable-win-x64 }}" class="portable-link" target="_blank">Portable Download</a>
+						</t-if>
+					</div>
 				</t-if>
 				<t-if test="linux-x64">
-					<a href="https://www.kruithne.net/wow.export/download/linux-x64/{{ linux-x64 }}" id="intro-button-linux">Download for Linux</a>
+					<div class="download-group">
+						<a href="https://www.kruithne.net/wow.export/download/linux-x64/{{ linux-x64 }}" id="intro-button-linux">Download for Linux</a>
+						<t-if test="portable-linux-x64">
+							<a href="{{ portable-linux-x64 }}" class="portable-link" target="_blank">Portable Download</a>
+						</t-if>
+					</div>
 				</t-if>
 				<t-if test="osx-x64">
-					<a href="https://www.kruithne.net/wow.export/download/osx-x64/{{ osx-x64 }}" id="intro-button-osx">Download for macOS</a>
+					<div class="download-group">
+						<a href="https://www.kruithne.net/wow.export/download/osx-x64/{{ osx-x64 }}" id="intro-button-osx">Download for macOS</a>
+						<t-if test="portable-osx-x64">
+							<a href="{{ portable-osx-x64 }}" class="portable-link" target="_blank">Portable Download</a>
+						</t-if>
+					</div>
 				</t-if>
 				<a href="https://discord.gg/kC3EzAYBtf" id="intro-button-discord" target="_blank">Get Help on Discord</a>
 				<a href="https://www.patreon.com/kruithne" id="intro-button-patreon" target="_blank">Support on Patreon</a>
