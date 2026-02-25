@@ -132,7 +132,7 @@ body {
 #intro-right {
 	margin-top: 30px;
 	display: flex;
-	align-items: center;
+	align-items: flex-start;
 	justify-content: center;
 	gap: 20px;
 	flex-wrap: wrap;
@@ -146,7 +146,7 @@ body {
 
 #intro-right .portable-link {
 	font-size: 0.85em;
-	color: var(--color-font-faded);
+	color: var(--color-font-link);
 	margin-top: 5px;
 	background: none;
 	padding: 0;
