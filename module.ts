@@ -861,6 +861,7 @@ let index_hash: string|null = null;
 interface TriggerUpdateRequest {
 	build_tag: string;
 	json: any;
+	handler: (build_tag: string, json: any) => Promise<void>;
 }
 
 const RELEASE_BUILD_FILE = './wow.export/data/release_builds.json';
@@ -971,7 +972,7 @@ export async function init(server: SpooderServer) {
 
 			const update_out_path = `./wow.export/update/${build_tag}/`;
 			const package_out_path = `./wow.export/download/${build_tag}/`;
-			
+
 			await fs.mkdir(update_out_path, { recursive: true });
 			await fs.mkdir(package_out_path, { recursive: true });
 
@@ -988,7 +989,7 @@ export async function init(server: SpooderServer) {
 			// move new update into place
 			await fs.rename(tmp_path, update_out_path + 'update');
 			await fs.rename(tmp_manifest_path, update_out_path + 'update.json');
-			
+
 			// package archive
 			log(`downloading archive file from ${json.package_url}`);
 			const package_basename = path.basename(json.package_url);
@@ -1008,10 +1009,54 @@ export async function init(server: SpooderServer) {
 			index = null; // force index re-render
 
 			await Bun.write(RELEASE_BUILD_FILE, JSON.stringify(release_builds));
-			
+
 			log(`successfully updated {${build_tag}}`);
 		} catch (e) {
 			caution('wow.export update failed', { e, build_tag, json });
+		}
+	}
+
+	async function process_trigger_update_electrobun(build_tag: string, json: any) {
+		try {
+			log(`accepting electrobun update for ${build_tag}`);
+
+			const update_dir = './wow.export/update/';
+			await fs.mkdir(update_dir, { recursive: true });
+
+			// update.json (electrobun manifest)
+			log(`downloading update.json from ${json.update_json_url}`);
+			const update_json_tmp = update_dir + build_tag + '-update.json.tmp';
+			await stream_to_file(json.update_json_url, update_json_tmp, 'update.json');
+			await fs.rename(update_json_tmp, update_dir + build_tag + '-update.json');
+
+			// bundle (.tar.zst)
+			log(`downloading bundle from ${json.bundle_url}`);
+			const bundle_name = build_tag + '-' + path.basename(json.bundle_url);
+			const bundle_tmp = update_dir + bundle_name + '.tmp';
+			await stream_to_file(json.bundle_url, bundle_tmp, 'bundle');
+			await fs.rename(bundle_tmp, update_dir + bundle_name);
+
+			// installer package (optional, for download page)
+			if (typeof json.installer_url === 'string') {
+				const download_dir = `./wow.export/download/${build_tag}/`;
+				await fs.mkdir(download_dir, { recursive: true });
+
+				const installer_name = path.basename(json.installer_url);
+				log(`downloading installer from ${json.installer_url}`);
+				const installer_tmp = download_dir + installer_name + '.tmp';
+				await stream_to_file(json.installer_url, installer_tmp, 'installer');
+				await fs.rename(installer_tmp, download_dir + installer_name);
+
+				release_builds[build_tag] = installer_name;
+			}
+
+			index = null; // force index re-render
+
+			await Bun.write(RELEASE_BUILD_FILE, JSON.stringify(release_builds));
+
+			log(`successfully updated {${build_tag}}`);
+		} catch (e) {
+			caution('wow.export electrobun update failed', { e, build_tag, json });
 		}
 	}
 
@@ -1026,15 +1071,15 @@ export async function init(server: SpooderServer) {
 			const request = trigger_update_queue.shift()!;
 			log(`processing trigger update for build ${request.build_tag}`);
 			
-			await process_trigger_update(request.build_tag, request.json);
+			await request.handler(request.build_tag, request.json);
 		}
 
 		is_processing_trigger_update = false;
 		log(`trigger update queue processing complete`);
 	}
 
-	function trigger_update(build_tag: string, json: any) {
-		trigger_update_queue.push({ build_tag, json });
+	function trigger_update(build_tag: string, json: any, handler: (build_tag: string, json: any) => Promise<void>) {
+		trigger_update_queue.push({ build_tag, json, handler });
 		log(`queued trigger update for ${build_tag} (${trigger_update_queue.length} in queue)`);
 		process_trigger_update_queue();
 	}
@@ -1081,10 +1126,16 @@ export async function init(server: SpooderServer) {
 		if (build_tag === null)
 			return HTTP_STATUS_CODE.BadRequest_400;
 
-		if (typeof json.update_url !== 'string' || typeof json.package_url !== 'string' || typeof json.manifest_url !== 'string')
+		const is_electrobun = typeof json.update_json_url === 'string' && typeof json.bundle_url === 'string';
+		const is_nwjs = typeof json.update_url === 'string' && typeof json.package_url === 'string' && typeof json.manifest_url === 'string';
+
+		if (is_electrobun)
+			trigger_update(build_tag, json, process_trigger_update_electrobun);
+		else if (is_nwjs)
+			trigger_update(build_tag, json, process_trigger_update);
+		else
 			return HTTP_STATUS_CODE.BadRequest_400;
 
-		trigger_update(build_tag, json);
 		return HTTP_STATUS_CODE.Accepted_202;
 	});
 
