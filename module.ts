@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { ColorInput } from 'bun';
 import { db } from './db';
+import { db_archavon } from './db_archavon';
 import { blte_unpack } from './casc/blte';
 import { tact_load_keys } from './casc/tact';
 import { bucket } from './obj_rds';
@@ -388,6 +389,91 @@ async function kino_process_queue(): Promise<void> {
 	}
 
 	kino_processing = null;
+}
+// endregion
+
+// region cache collection
+const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
+
+const cache_worker = new Worker('./wow.export/cache_worker.ts');
+cache_worker.onmessage = (event: MessageEvent) => {
+	const { type, text } = event.data;
+	if (type === 'log')
+		log(`cache ${text}`);
+};
+
+const CACHE_ALLOWED_PRODUCTS = new Set([
+	'wow', 'wowt', 'wow_beta',
+	'wow_classic', 'wow_classic_era', 'wow_classic_beta',
+	'wow_classic_ptr', 'wow_classic_era_ptr',
+	'wow_classic_titan', 'wow_anniversary'
+]);
+
+const CACHE_ALLOWED_FILES = new Set([
+	'creaturecache.wdb',
+	'gameobjectcache.wdb',
+	'itemcache.wdb',
+	'itemnamecache.wdb',
+	'itemtextcache.wdb',
+	'npccache.wdb',
+	'pagetextcache.wdb',
+	'questcache.wdb',
+	'wowcache.wdb'
+]);
+
+const CACHE_MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+
+interface CacheSubmitPayload {
+	machine_id: string;
+	product: string;
+	patch: string;
+	build_number: number;
+	build_key: string;
+	cdn_key: string;
+	binary_hash: string;
+	files: Array<{ name: string; locale: string; size: number }>;
+}
+
+interface CacheFinalizePayload {
+	submission_id: string;
+	checksums: Record<string, string>;
+}
+
+async function cache_cleanup_stale() {
+	try {
+		await db_archavon`
+			DELETE FROM cache_submissions
+			WHERE finalized_at IS NULL AND submitted_at < NOW() - INTERVAL 1 HOUR
+		`;
+		log(`cache stale cleanup complete`);
+	} catch (e) {
+		caution('cache: stale cleanup failed', { error: e });
+	}
+}
+
+async function cache_recover_pending() {
+	try {
+		const pending = await db_archavon`
+			SELECT submission_id FROM cache_submissions
+			WHERE finalized_at IS NOT NULL
+		`;
+
+		for (const row of pending)
+			cache_worker.postMessage({ submission_id: row.submission_id });
+
+		if (pending.length > 0)
+			log(`cache recovered {${pending.length}} pending submissions`);
+	} catch (e) {
+		caution('cache: startup recovery failed', { error: e });
+	}
+}
+
+function cache_is_valid_hex(str: unknown, len: number): boolean {
+	return typeof str === 'string' && new RegExp(`^[a-f0-9]{${len}}$`).test(str);
+}
+
+function cache_is_valid_uuid(str: unknown): boolean {
+	return typeof str === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(str);
 }
 // endregion
 
@@ -1176,4 +1262,154 @@ export async function init(server: SpooderServer) {
 
 		return HTTP_STATUS_CODE.Accepted_202;
 	});
+
+	// cache collection endpoints
+	server.json('/wow.export/v2/cache/submit', async (req, url, json) => {
+		if (!req.headers.get('user-agent')?.startsWith('wow.export'))
+			return HTTP_STATUS_CODE.Forbidden_403;
+
+		const { machine_id, product, patch, build_number, build_key, cdn_key, binary_hash, files } = json as unknown as CacheSubmitPayload;
+
+		if (!cache_is_valid_uuid(machine_id))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		if (typeof product !== 'string' || !CACHE_ALLOWED_PRODUCTS.has(product))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		if (typeof patch !== 'string' || patch.length === 0 || patch.length > 16)
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		if (!Number.isInteger(build_number) || build_number <= 0)
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		if (!cache_is_valid_hex(build_key, 32))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		if (!cache_is_valid_hex(cdn_key, 32))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		if (!cache_is_valid_hex(binary_hash, 64))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		if (!Array.isArray(files) || files.length === 0)
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		for (const file of files) {
+			if (typeof file !== 'object' || file === null)
+				return HTTP_STATUS_CODE.BadRequest_400;
+
+			if (typeof file.name !== 'string' || !CACHE_ALLOWED_FILES.has(file.name.toLowerCase()))
+				return HTTP_STATUS_CODE.BadRequest_400;
+
+			if (typeof file.locale !== 'string' || file.locale.length === 0 || file.locale.length > 16)
+				return HTTP_STATUS_CODE.BadRequest_400;
+
+			if (!Number.isInteger(file.size) || file.size <= 32 || file.size > CACHE_MAX_FILE_SIZE)
+				return HTTP_STATUS_CODE.BadRequest_400;
+		}
+
+		const submission_id = crypto.randomUUID();
+		const provisioned: Array<{ object_id: string; file: any }> = [];
+
+		try {
+			const upload_urls: Record<string, string> = {};
+			const file_rows: Array<{ submission_id: string; file_name: string; locale: string; file_size: number; object_id: string }> = [];
+
+			for (const file of files) {
+				const file_key = `${file.locale}/${file.name}`;
+				const object_id = await cache_bucket.provision(file_key, 'application/octet-stream', file.size);
+
+				if (object_id === null)
+					throw new Error(`provision failed for ${file_key}`);
+
+				provisioned.push({ object_id, file });
+				upload_urls[file_key] = cache_bucket.presign(object_id, undefined, 'upload');
+
+				file_rows.push({
+					submission_id,
+					file_name: file.name,
+					locale: file.locale,
+					file_size: file.size,
+					object_id
+				});
+			}
+
+			await db_archavon`
+				INSERT INTO cache_submissions (submission_id, machine_id, product, patch, build_number, build_key, cdn_key, binary_hash)
+				VALUES (${submission_id}, ${machine_id}, ${product}, ${patch}, ${build_number}, ${build_key}, ${cdn_key}, ${binary_hash})
+			`;
+
+			await db_archavon`INSERT INTO cache_submission_files ${db_archavon(file_rows)}`;
+
+			return { submission_id, upload_urls };
+		} catch (e) {
+			// cleanup provisioned objects on failure
+			for (const { object_id } of provisioned) {
+				try {
+					await cache_bucket.delete(object_id);
+				} catch {}
+			}
+
+			caution('cache submit failed', { error: e, submission_id });
+			return HTTP_STATUS_CODE.InternalServerError_500;
+		}
+	});
+
+	server.json('/wow.export/v2/cache/finalize', async (req, url, json) => {
+		if (!req.headers.get('user-agent')?.startsWith('wow.export'))
+			return HTTP_STATUS_CODE.Forbidden_403;
+
+		const { submission_id, checksums } = json as unknown as CacheFinalizePayload;
+
+		if (!cache_is_valid_uuid(submission_id))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		if (typeof checksums !== 'object' || checksums === null || Array.isArray(checksums))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		try {
+			const submissions = await db_archavon`
+				SELECT submission_id, finalized_at FROM cache_submissions
+				WHERE submission_id = ${submission_id}
+			`;
+
+			if (submissions.length === 0)
+				return HTTP_STATUS_CODE.NotFound_404;
+
+			if (submissions[0].finalized_at !== null)
+				return HTTP_STATUS_CODE.Conflict_409;
+
+			const files = await db_archavon`
+				SELECT file_name, locale, object_id FROM cache_submission_files
+				WHERE submission_id = ${submission_id}
+			`;
+
+			for (const file of files) {
+				const file_key = `${file.locale}/${file.file_name}`;
+				const checksum = checksums[file_key];
+
+				try {
+					await cache_bucket.finalize(file.object_id, typeof checksum === 'string' ? checksum : undefined);
+				} catch (e) {
+					log(`cache finalize failed for {${file.object_id}}: ${(e as Error).message}`);
+				}
+			}
+
+			await db_archavon`
+				UPDATE cache_submissions SET finalized_at = NOW()
+				WHERE submission_id = ${submission_id}
+			`;
+
+			cache_worker.postMessage({ submission_id });
+
+			return HTTP_STATUS_CODE.OK_200;
+		} catch (e) {
+			caution('cache finalize failed', { error: e, submission_id });
+			return HTTP_STATUS_CODE.InternalServerError_500;
+		}
+	});
+
+	// cache startup recovery + stale cleanup
+	cache_cleanup_stale();
+	cache_recover_pending();
 }
