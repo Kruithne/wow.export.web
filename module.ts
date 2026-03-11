@@ -1402,7 +1402,7 @@ export async function init(server: SpooderServer) {
 
 			cache_worker.postMessage({ submission_id });
 
-			return HTTP_STATUS_CODE.OK_200;
+			return { success: true };
 		} catch (e) {
 			caution('cache finalize failed', { error: e, submission_id });
 			return HTTP_STATUS_CODE.InternalServerError_500;
