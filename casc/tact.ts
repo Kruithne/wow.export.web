@@ -1,4 +1,4 @@
-import { log_create_logger } from 'spooder';
+import { log_create_logger, caution } from 'spooder';
 import { cache_get_file, cache_put_file } from '../cache';
 import { db } from '../db';
 
@@ -77,6 +77,7 @@ export async function tact_load_keys(): Promise<void> {
 					data = await cached.text();
 				} else {
 					log`failed to fetch tact keys (status: ${res.status}), no cached version available - tact support disabled`;
+					caution('tact support disabled', { status: res.status });
 					tact_available = false;
 					return;
 				}
@@ -93,6 +94,7 @@ export async function tact_load_keys(): Promise<void> {
 				data = await cached.text();
 			} else {
 				log`failed to fetch tact keys (${e}), no cached version available - tact support disabled`;
+				caution('tact support disabled', { error: e });
 				tact_available = false;
 				return;
 			}
