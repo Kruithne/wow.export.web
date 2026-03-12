@@ -135,6 +135,8 @@ type CASCVersionEntry = {
 	Region: string;
 };
 
+const CASC_CDN_FALLBACK_HOSTS = ['cdn.blizzard.com', 'archive.wow.tools'];
+
 let casc_cdn_hosts: string[] = [];
 let casc_cdn_path: string = '';
 let casc_ready: Promise<void> | null = null;
@@ -219,11 +221,13 @@ async function casc_init(): Promise<void> {
 
 	casc_cdn_path = cdn_config.Path;
 
-	// ping hosts to find fastest
+	// ping hosts to find fastest, with community fallbacks appended
 	const hosts = cdn_config.Hosts.split(' ');
-	log(`casc pinging {${hosts.length}} CDN hosts`);
+	const fallback_hosts = CASC_CDN_FALLBACK_HOSTS.filter(h => !hosts.includes(h));
+	const all_hosts = [...hosts, ...fallback_hosts];
+	log(`casc pinging {${all_hosts.length}} CDN hosts (${fallback_hosts.length} fallback)`);
 
-	const ping_results = await Promise.all(hosts.map(async host => {
+	const ping_results = await Promise.all(all_hosts.map(async host => {
 		const url = `https://${host}`;
 		const start = performance.now();
 
@@ -235,11 +239,17 @@ async function casc_init(): Promise<void> {
 		}
 	}));
 
-	const valid_hosts = ping_results.filter((r): r is { host: string; time: number } => r !== null);
-	if (valid_hosts.length === 0)
-		throw new ErrorWithMetadata('casc: all CDN hosts failed ping', { hosts });
+	const fallback_set = new Set(fallback_hosts);
+	const valid_primary = ping_results.filter((r): r is { host: string; time: number } => r !== null && !fallback_set.has(r.host));
+	const valid_fallback = ping_results.filter((r): r is { host: string; time: number } => r !== null && fallback_set.has(r.host));
 
-	valid_hosts.sort((a, b) => a.time - b.time);
+	valid_primary.sort((a, b) => a.time - b.time);
+	valid_fallback.sort((a, b) => a.time - b.time);
+
+	const valid_hosts = [...valid_primary, ...valid_fallback];
+	if (valid_hosts.length === 0)
+		throw new ErrorWithMetadata('casc: all CDN hosts failed ping', { all_hosts });
+
 	casc_cdn_hosts = valid_hosts.map(r => r.host);
 
 	log(`casc CDN host priority: {${casc_cdn_hosts.join(', ')}}`);
