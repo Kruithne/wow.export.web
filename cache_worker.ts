@@ -3,8 +3,16 @@ import { db_archavon } from './db_archavon';
 import { bucket } from './obj_rds';
 import { parse_wdb } from './wdb';
 import { parse_dbcache } from './dbcache';
+import { upsert_machine, store_creatures, store_quests, store_gameobjects, store_pagetext } from './wdb_store';
 
 const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
+
+const WDB_STORE_MAP: Record<string, typeof store_creatures> = {
+	'WMOB': store_creatures,
+	'WQST': store_quests,
+	'WGOB': store_gameobjects,
+	'WPTX': store_pagetext
+};
 
 const queue: string[] = [];
 let processing = false;
@@ -42,7 +50,7 @@ async function process_queue() {
 
 async function process_submission(submission_id: string) {
 	const [submission] = await db_archavon`
-		SELECT build_number
+		SELECT build_number, machine_id
 		FROM cache_submissions
 		WHERE submission_id = ${submission_id}
 	`;
@@ -53,6 +61,9 @@ async function process_submission(submission_id: string) {
 	}
 
 	const build_number = submission.build_number as number;
+	const machine_id = submission.machine_id as string;
+
+	await upsert_machine(db_archavon, machine_id);
 
 	const files = await db_archavon`
 		SELECT file_name, locale, object_id
@@ -71,9 +82,15 @@ async function process_submission(submission_id: string) {
 			if (file.file_name.endsWith('.wdb')) {
 				const result = parse_wdb(data);
 				if (result) {
-					log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, build=${result.header.build}`);
-					for (const record of result.records.slice(0, 5))
-						log(`  [${record.id}] ${JSON.stringify(record.data)}`);
+					const valid_records = result.records.filter(r => !('parse_error' in r.data));
+					const sig = result.header.signature;
+					const store_fn = WDB_STORE_MAP[sig];
+					if (store_fn) {
+						const stored = await store_fn(db_archavon, valid_records, file.locale, build_number, machine_id, submission_id);
+						log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, stored ${stored} (${sig})`);
+					} else {
+						log(`wdb {${file.locale}/${file.file_name}}: unknown signature ${sig}, ${result.records.length} records skipped`);
+					}
 				} else {
 					log(`wdb {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
 				}
