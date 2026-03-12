@@ -50,7 +50,7 @@ async function process_queue() {
 
 async function process_submission(submission_id: string) {
 	const [submission] = await db_archavon`
-		SELECT build_number, machine_id
+		SELECT build_number, machine_id, patch
 		FROM cache_submissions
 		WHERE submission_id = ${submission_id}
 	`;
@@ -62,6 +62,7 @@ async function process_submission(submission_id: string) {
 
 	const build_number = submission.build_number as number;
 	const machine_id = submission.machine_id as string;
+	const patch = submission.patch as string;
 
 	await upsert_machine(db_archavon, machine_id);
 
@@ -80,14 +81,15 @@ async function process_submission(submission_id: string) {
 			const data = await res.arrayBuffer();
 
 			if (file.file_name.endsWith('.wdb')) {
-				const result = parse_wdb(data);
+				const result = parse_wdb(data, patch);
 				if (result) {
 					const valid_records = result.records.filter(r => !('parse_error' in r.data));
+					const parse_errors = result.records.length - valid_records.length;
 					const sig = result.header.signature;
 					const store_fn = WDB_STORE_MAP[sig];
 					if (store_fn) {
 						const stored = await store_fn(db_archavon, valid_records, file.locale, build_number, machine_id, submission_id);
-						log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, stored ${stored} (${sig})`);
+						log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, stored ${stored}, ${parse_errors} parse errors (${sig})`);
 					} else {
 						log(`wdb {${file.locale}/${file.file_name}}: unknown signature ${sig}, ${result.records.length} records skipped`);
 					}

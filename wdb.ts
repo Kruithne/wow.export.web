@@ -2,11 +2,30 @@ import BufferReader from './buffer';
 
 const WDB_HEADER_SIZE = 24;
 
-// todo: check actual build numbers
-const BUILD_11_2 = 59000;
-const BUILD_11_2_7 = 62500;
-const BUILD_11_2_7_PAD = 64228;
-const BUILD_12_0 = 64500;
+interface GameVersion {
+	expansion: number;
+	major: number;
+	minor: number;
+	build: number;
+}
+
+function parse_game_version(patch: string, build: number): GameVersion {
+	const parts = patch.split('.').map(Number);
+	return {
+		expansion: parts[0] ?? 0,
+		major: parts[1] ?? 0,
+		minor: parts[2] ?? 0,
+		build
+	};
+}
+
+function ver_gte(ver: GameVersion, exp: number, maj: number, min: number): boolean {
+	if (ver.expansion !== exp)
+		return ver.expansion > exp;
+	if (ver.major !== maj)
+		return ver.major > maj;
+	return ver.minor >= min;
+}
 
 interface WdbHeader {
 	signature: string;
@@ -249,7 +268,7 @@ class BitReader {
 	}
 }
 
-type BodyParser = (buf: BufferReader, length: number, build: number) => RecordData;
+type BodyParser = (buf: BufferReader, length: number, ver: GameVersion) => RecordData;
 
 function reverse_chars(str: string): string {
 	return str.split('').reverse().join('');
@@ -271,7 +290,7 @@ function read_header(buf: BufferReader): WdbHeader {
 	return { signature, build, locale, record_size, record_version, cache_version };
 }
 
-function parse_creature(buf: BufferReader, length: number, build: number): CreatureRecord {
+function parse_creature(buf: BufferReader, length: number, ver: GameVersion): CreatureRecord {
 	const ds = new BitReader(buf);
 
 	const title_len = ds.read_bits(11);
@@ -297,12 +316,12 @@ function parse_creature(buf: BufferReader, length: number, build: number): Creat
 	const flags_1 = buf.readUInt32LE();
 	const flags = [flags_0, flags_1];
 
-	if (build >= BUILD_11_2)
+	if (ver_gte(ver, 11, 2, 0))
 		buf.readUInt32LE(); // TWW_112_Int
 
-	const creature_type = build >= BUILD_11_2 ? buf.readUInt8() : buf.readUInt32LE();
+	const creature_type = ver_gte(ver, 11, 2, 0) ? buf.readUInt8() : buf.readUInt32LE();
 	const creature_family = buf.readUInt32LE();
-	const classification = build >= BUILD_11_2 ? buf.readUInt8() : buf.readUInt32LE();
+	const classification = ver_gte(ver, 11, 2, 0) ? buf.readUInt8() : buf.readUInt32LE();
 
 	const proxy_creature_ids = [buf.readUInt32LE(), buf.readUInt32LE()];
 
@@ -352,7 +371,7 @@ function parse_creature(buf: BufferReader, length: number, build: number): Creat
 	};
 }
 
-function parse_quest(buf: BufferReader, length: number, build: number): QuestRecord {
+function parse_quest(buf: BufferReader, length: number, ver: GameVersion): QuestRecord {
 	const quest_id = buf.readUInt32LE();
 	const quest_type = buf.readUInt32LE();
 	const quest_package_id = buf.readUInt32LE();
@@ -375,7 +394,7 @@ function parse_quest(buf: BufferReader, length: number, build: number): QuestRec
 	const reward_honor_multiplier = buf.readFloatLE();
 
 	let reward_favor = 0;
-	if (build >= BUILD_12_0)
+	if (ver_gte(ver, 12, 0, 0) && ver.build >= 64611)
 		reward_favor = buf.readUInt32LE();
 
 	const reward_artifact_xp_difficulty = buf.readUInt32LE();
@@ -384,7 +403,7 @@ function parse_quest(buf: BufferReader, length: number, build: number): QuestRec
 	const provided_item = buf.readUInt32LE();
 
 	const flags = [buf.readUInt32LE(), buf.readUInt32LE(), buf.readUInt32LE()];
-	if (build >= BUILD_11_2)
+	if (ver_gte(ver, 11, 2, 0))
 		flags.push(buf.readUInt32LE());
 
 	const reward_fixed_items: QuestRewardFixedItem[] = [];
@@ -466,7 +485,7 @@ function parse_quest(buf: BufferReader, length: number, build: number): QuestRec
 	let house_room_reward_ids: number[] = [];
 	let decor_reward_ids: number[] = [];
 
-	if (build >= BUILD_11_2_7) {
+	if (ver_gte(ver, 11, 2, 7)) {
 		const num_house_room_rewards = buf.readUInt32LE();
 		const num_decor_rewards = buf.readUInt32LE();
 		house_room_reward_ids = buf.readUInt32Array(num_house_room_rewards);
@@ -512,7 +531,7 @@ function parse_quest(buf: BufferReader, length: number, build: number): QuestRec
 		const object_id = buf.readUInt32LE();
 		const amount = buf.readUInt32LE();
 
-		if (build >= BUILD_11_2_7)
+		if (ver_gte(ver, 11, 2, 7))
 			buf.readUInt32LE(); // ObjectiveUNK
 
 		const obj_flags = buf.readUInt32LE();
@@ -522,12 +541,12 @@ function parse_quest(buf: BufferReader, length: number, build: number): QuestRec
 		const num_visual_effects = buf.readUInt32LE();
 		const visual_effects = buf.readUInt32Array(num_visual_effects);
 
-		if (build >= BUILD_11_2_7)
+		if (ver_gte(ver, 11, 2, 7))
 			buf.readUInt32LE(); // WorldEffectID
 
 		const description_length = buf.readUInt8();
 
-		if (build >= BUILD_11_2_7_PAD)
+		if (ver_gte(ver, 11, 2, 7) && ver.build >= 64228)
 			buf.readUInt8(); // padding
 
 		const description = ds.read_string(description_length).replace(/\0+$/, '');
@@ -610,7 +629,7 @@ function parse_quest(buf: BufferReader, length: number, build: number): QuestRec
 	};
 }
 
-function parse_gameobject(buf: BufferReader, length: number, build: number): GameObjectRecord {
+function parse_gameobject(buf: BufferReader, length: number, ver: GameVersion): GameObjectRecord {
 	const type = buf.readUInt32LE();
 	const display_id = buf.readUInt32LE();
 
@@ -633,13 +652,13 @@ function parse_gameobject(buf: BufferReader, length: number, build: number): Gam
 	const quest_items = buf.readUInt32Array(num_quest_items);
 	const content_tuning_id = buf.readUInt32LE();
 
-	if (build >= BUILD_11_2)
+	if (ver_gte(ver, 11, 2, 0))
 		buf.readUInt32LE(); // TWW_112_Int
 
 	return { type, display_id, names, icon, action, condition, game_data, scale, quest_items, content_tuning_id };
 }
 
-function parse_pagetext(buf: BufferReader, _length: number, _build: number): PageTextRecord {
+function parse_pagetext(buf: BufferReader, _length: number, _ver: GameVersion): PageTextRecord {
 	const page_text_id = buf.readUInt32LE();
 	const next_page_text_id = buf.readUInt32LE();
 	const player_condition_id = buf.readUInt32LE();
@@ -652,7 +671,7 @@ function parse_pagetext(buf: BufferReader, _length: number, _build: number): Pag
 	return { page_text_id, next_page_text_id, player_condition_id, flags, text };
 }
 
-function parse_fallback(_buf: BufferReader, length: number, _build: number): Record<string, unknown> {
+function parse_fallback(_buf: BufferReader, length: number, _ver: GameVersion): Record<string, unknown> {
 	return { raw_size: length };
 }
 
@@ -663,12 +682,13 @@ const BODY_PARSERS: Record<string, BodyParser> = {
 	'WPTX': parse_pagetext,
 };
 
-export function parse_wdb(data: ArrayBuffer): WdbResult | null {
+export function parse_wdb(data: ArrayBuffer, patch: string): WdbResult | null {
 	if (data.byteLength < WDB_HEADER_SIZE)
 		return null;
 
 	const buf = new BufferReader(data);
 	const header = read_header(buf);
+	const ver = parse_game_version(patch, header.build);
 
 	const body_parser = BODY_PARSERS[header.signature] ?? parse_fallback;
 
@@ -688,7 +708,7 @@ export function parse_wdb(data: ArrayBuffer): WdbResult | null {
 
 		let parsed: RecordData;
 		try {
-			parsed = body_parser(buf, length, header.build);
+			parsed = body_parser(buf, length, ver);
 		} catch {
 			parsed = { raw_size: length, parse_error: true };
 		}
