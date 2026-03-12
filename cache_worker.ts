@@ -50,7 +50,7 @@ async function process_queue() {
 
 async function process_submission(submission_id: string) {
 	const [submission] = await db_archavon`
-		SELECT build_number, machine_id, patch
+		SELECT build_number, machine_id, patch, product
 		FROM cache_submissions
 		WHERE submission_id = ${submission_id}
 	`;
@@ -63,6 +63,9 @@ async function process_submission(submission_id: string) {
 	const build_number = submission.build_number as number;
 	const machine_id = submission.machine_id as string;
 	const patch = submission.patch as string;
+	const product = submission.product as string;
+
+	log(`submission {${submission_id}} ${product} ${patch}.${build_number} (machine: ${machine_id})`);
 
 	await upsert_machine(db_archavon, machine_id);
 
