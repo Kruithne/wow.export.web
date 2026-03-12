@@ -412,13 +412,8 @@ const CACHE_ALLOWED_PRODUCTS = new Set([
 const CACHE_ALLOWED_FILES = new Set([
 	'creaturecache.wdb',
 	'gameobjectcache.wdb',
-	'itemcache.wdb',
-	'itemnamecache.wdb',
-	'itemtextcache.wdb',
-	'npccache.wdb',
 	'pagetextcache.wdb',
 	'questcache.wdb',
-	'wowcache.wdb'
 ]);
 
 const CACHE_MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB

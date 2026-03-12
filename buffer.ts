@@ -126,6 +126,40 @@ export default class BufferReader {
 		return value;
 	}
 
+	readUInt64LE(): bigint {
+		const lo = this.view.getUint32(this._offset, true);
+		const hi = this.view.getUint32(this._offset + 4, true);
+		this._offset += 8;
+		return (BigInt(hi) << 32n) | BigInt(lo);
+	}
+
+	readFloatLE(): number {
+		const value = this.view.getFloat32(this._offset, true);
+		this._offset += 4;
+		return value;
+	}
+
+	readNullTermString(): string {
+		const start = this._offset;
+		const bytes = new Uint8Array(this.buffer);
+
+		while (this._offset < this.byteLength && bytes[this._offset] !== 0)
+			this._offset++;
+
+		const str = new TextDecoder().decode(bytes.subarray(start, this._offset));
+
+		if (this._offset < this.byteLength)
+			this._offset++;
+
+		return str;
+	}
+
+	readStringFixed(length: number): string {
+		const bytes = new Uint8Array(this.buffer, this._offset, length);
+		this._offset += length;
+		return new TextDecoder().decode(bytes);
+	}
+
 	readBytes(count: number): Uint8Array {
 		const bytes = new Uint8Array(this.buffer, this._offset, count);
 		this._offset += count;

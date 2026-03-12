@@ -1,6 +1,7 @@
 import { caution } from 'spooder';
 import { db_archavon } from './db_archavon';
 import { bucket } from './obj_rds';
+import { parse_wdb } from './wdb';
 
 const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
 
@@ -53,10 +54,14 @@ async function process_submission(submission_id: string) {
 			const res = await cache_bucket.download(file.object_id);
 			const data = await res.arrayBuffer();
 
-			// TODO
-			const view = new DataView(data);
-			const magic = data.byteLength >= 4 ? String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3)) : '????';
-			log(`wdb {${file.locale}/${file.file_name}}: ${data.byteLength} bytes, magic={${magic}}`);
+			const result = parse_wdb(data);
+			if (result) {
+				log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, build=${result.header.build}`);
+				for (const record of result.records.slice(0, 5))
+					log(`  [${record.id}] ${JSON.stringify(record.data)}`);
+			} else {
+				log(`wdb {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
+			}
 
 			processed++;
 		} catch (e) {
