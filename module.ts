@@ -370,7 +370,7 @@ async function kino_process_video(entry: KinoQueueEntry, cache_key: string): Pro
 
 		await db`INSERT INTO kino_cached (enc) VALUES (${cache_key})`;
 	} catch (e) {
-		caution('kino: failed to process video', { error: e, vid, aud, srt });
+		log(`kino: failed to process video ${e} ${vid} ${aud} ${srt}`);
 	} finally {
 		await fs.rm(temp_dir, { recursive: true, force: true });
 	}
