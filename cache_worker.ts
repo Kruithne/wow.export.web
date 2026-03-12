@@ -96,7 +96,7 @@ async function process_submission(submission_id: string) {
 				} else {
 					log(`wdb {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
 				}
-			} else if (file.file_name === 'dbcache.bin') {
+			} else if (file.file_name.toLowerCase() === 'dbcache.bin') {
 				const result = parse_dbcache(data);
 				if (result) {
 					log(`dbcache {${file.locale}/${file.file_name}}: ${result.entries.length} entries, build=${result.header.build}, version=${result.header.version}`);
