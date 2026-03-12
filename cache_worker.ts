@@ -2,6 +2,7 @@ import { caution } from 'spooder';
 import { db_archavon } from './db_archavon';
 import { bucket } from './obj_rds';
 import { parse_wdb } from './wdb';
+import { parse_dbcache } from './dbcache';
 
 const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
 
@@ -54,13 +55,24 @@ async function process_submission(submission_id: string) {
 			const res = await cache_bucket.download(file.object_id);
 			const data = await res.arrayBuffer();
 
-			const result = parse_wdb(data);
-			if (result) {
-				log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, build=${result.header.build}`);
-				for (const record of result.records.slice(0, 5))
-					log(`  [${record.id}] ${JSON.stringify(record.data)}`);
-			} else {
-				log(`wdb {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
+			if (file.file_name.endsWith('.wdb')) {
+				const result = parse_wdb(data);
+				if (result) {
+					log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, build=${result.header.build}`);
+					for (const record of result.records.slice(0, 5))
+						log(`  [${record.id}] ${JSON.stringify(record.data)}`);
+				} else {
+					log(`wdb {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
+				}
+			} else if (file.file_name === 'dbcache.bin') {
+				const result = parse_dbcache(data);
+				if (result) {
+					log(`dbcache {${file.locale}/${file.file_name}}: ${result.entries.length} entries, build=${result.header.build}, version=${result.header.version}`);
+					for (const entry of result.entries.slice(0, 5))
+						log(`  table=0x${entry.table_hash.toString(16).padStart(8, '0')} record=${entry.record_id} status=${entry.status} push=${entry.push_id}`);
+				} else {
+					log(`dbcache {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
+				}
 			}
 
 			processed++;

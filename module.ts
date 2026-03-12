@@ -413,6 +413,7 @@ const CACHE_ALLOWED_FILES = new Set([
 	'creaturecache.wdb',
 	'gameobjectcache.wdb',
 	'pagetextcache.wdb',
+	'dbcache.bin',
 	'questcache.wdb',
 ]);
 
