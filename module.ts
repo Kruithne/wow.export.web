@@ -438,11 +438,33 @@ interface CacheFinalizePayload {
 
 async function cache_cleanup_stale() {
 	try {
-		await db_archavon`
-			DELETE FROM cache_submissions
+		const stale = await db_archavon`
+			SELECT submission_id FROM cache_submissions
 			WHERE finalized_at IS NULL AND submitted_at < NOW() - INTERVAL 1 HOUR
 		`;
-		log(`cache stale cleanup complete`);
+
+		if (stale.length === 0)
+			return;
+
+		const stale_ids = stale.map((r: { submission_id: string }) => r.submission_id);
+
+		const files = await db_archavon`
+			SELECT object_id FROM cache_submission_files
+			WHERE submission_id IN ${db_archavon(stale_ids)}
+		`;
+
+		for (const file of files) {
+			try {
+				await cache_bucket.delete(file.object_id);
+			} catch {}
+		}
+
+		await db_archavon`
+			DELETE FROM cache_submissions
+			WHERE submission_id IN ${db_archavon(stale_ids)}
+		`;
+
+		log(`cache stale cleanup: removed ${stale.length} submissions, ${files.length} CDN objects`);
 	} catch (e) {
 		caution('cache: stale cleanup failed', { error: e });
 	}
