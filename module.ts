@@ -11,6 +11,7 @@ import { blte_unpack } from './casc/blte';
 import { tact_load_keys } from './casc/tact';
 import { bucket } from './obj_rds';
 import { sbt_to_srt } from './subtitles';
+import { sstrhash } from './sstrhash';
 
 const LISTFILE_HASH_THRESHOLD = 100;
 
@@ -1168,6 +1169,7 @@ export async function init(server: SpooderServer) {
 
 	let is_updating_listfile = false;
 	let is_updating_tact = false;
+	let is_updating_dbd = false;
 
 	async function trigger_listfile_update() {
 		if (is_updating_listfile)
@@ -1194,6 +1196,56 @@ export async function init(server: SpooderServer) {
 			await update_tact();
 			is_updating_tact = false;
 		});
+		return 200;
+	});
+
+	async function trigger_dbd_update() {
+		if (is_updating_dbd)
+			return;
+
+		is_updating_dbd = true;
+
+		try {
+			log('fetching {WoWDBDefs} manifest...');
+			const res = await fetch('https://raw.githubusercontent.com/wowdev/WoWDBDefs/refs/heads/master/manifest.json');
+			if (!res.ok)
+				throw new Error('manifest fetch failed: ' + res.status);
+
+			const manifest = await res.json() as Array<{ tableName: string, db2FileDataID: number }>;
+
+			const BATCH_SIZE = 500;
+			let total = 0;
+
+			for (let i = 0; i < manifest.length; i += BATCH_SIZE) {
+				const batch = manifest.slice(i, i + BATCH_SIZE);
+				const placeholders: string[] = [];
+				const params: any[] = [];
+
+				for (const entry of batch) {
+					placeholders.push('(?, ?)');
+					params.push(sstrhash(entry.tableName) >>> 0, entry.tableName);
+				}
+
+				await db_archavon.unsafe(
+					`INSERT INTO db2_table_hashes (table_hash, table_name) VALUES ${placeholders.join(',')} ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)`,
+					params
+				);
+
+				total += batch.length;
+			}
+
+			log(`{WoWDBDefs} table hash mapping updated: {${total}} entries`);
+		} catch (e) {
+			caution('dbd: failed to update table hash mapping', { error: e });
+		}
+
+		is_updating_dbd = false;
+	}
+
+	trigger_dbd_update();
+
+	server.webhook(process.env.DBD_WEBHOOK_SECRET!, '/wow.export/v2/trigger_dbd_rebuild', (payload) => {
+		setImmediate(trigger_dbd_update);
 		return 200;
 	});
 

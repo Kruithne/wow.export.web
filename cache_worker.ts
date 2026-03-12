@@ -41,6 +41,19 @@ async function process_queue() {
 }
 
 async function process_submission(submission_id: string) {
+	const [submission] = await db_archavon`
+		SELECT build_number
+		FROM cache_submissions
+		WHERE submission_id = ${submission_id}
+	`;
+
+	if (!submission) {
+		log(`submission {${submission_id}} not found, skipping`);
+		return;
+	}
+
+	const build_number = submission.build_number as number;
+
 	const files = await db_archavon`
 		SELECT file_name, locale, object_id
 		FROM cache_submission_files
@@ -68,8 +81,38 @@ async function process_submission(submission_id: string) {
 				const result = parse_dbcache(data);
 				if (result) {
 					log(`dbcache {${file.locale}/${file.file_name}}: ${result.entries.length} entries, build=${result.header.build}, version=${result.header.version}`);
-					for (const entry of result.entries.slice(0, 5))
-						log(`  table=0x${entry.table_hash.toString(16).padStart(8, '0')} record=${entry.record_id} status=${entry.status} push=${entry.push_id}`);
+
+					const BATCH_SIZE = 500;
+					let inserted = 0;
+
+					for (let i = 0; i < result.entries.length; i += BATCH_SIZE) {
+						const batch = result.entries.slice(i, i + BATCH_SIZE);
+						const placeholders: string[] = [];
+						const params: any[] = [];
+
+						for (const entry of batch) {
+							placeholders.push('(?, ?, ?, ?, ?, ?, ?, ?)');
+							params.push(
+								entry.table_hash >>> 0,
+								entry.record_id >>> 0,
+								entry.push_id >>> 0,
+								entry.unique_id >>> 0,
+								entry.region_id >>> 0,
+								entry.status,
+								build_number,
+								entry.record_data ? Buffer.from(entry.record_data) : null
+							);
+						}
+
+						await db_archavon.unsafe(
+							`INSERT IGNORE INTO hotfix_entries (table_hash, record_id, push_id, unique_id, region_id, status, game_build, data_blob) VALUES ${placeholders.join(',')}`,
+							params
+						);
+
+						inserted += batch.length;
+					}
+
+					log(`dbcache {${file.locale}/${file.file_name}}: stored {${inserted}} hotfix entries`);
 				} else {
 					log(`dbcache {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
 				}

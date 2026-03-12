@@ -17,6 +17,7 @@ interface DbCacheEntry {
 	data_size: number;
 	region_id: number;
 	unique_id: number;
+	record_data: ArrayBuffer | null;
 }
 
 interface DbCacheResult {
@@ -66,11 +67,11 @@ function read_entry(buf: BufferReader, version: number): DbCacheEntry | null {
 	// pad[3]
 	buf.move(3);
 
-	// skip raw record data
+	let record_data: ArrayBuffer | null = null;
 	if (data_size > 0)
-		buf.move(data_size);
+		record_data = buf.readBuffer(data_size, false) as ArrayBuffer;
 
-	return { table_hash, record_id, status, push_id, data_size, region_id, unique_id };
+	return { table_hash, record_id, status, push_id, data_size, region_id, unique_id, record_data };
 }
 
 export function parse_dbcache(data: ArrayBuffer): DbCacheResult | null {
