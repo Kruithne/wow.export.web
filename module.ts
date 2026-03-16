@@ -1485,9 +1485,11 @@ export async function init(server: SpooderServer) {
 				});
 			}
 
+			const client_ip_hash = crypto.createHash('sha256').update(client_ip).digest('hex');
+
 			await db_archavon`
 				INSERT INTO cache_submissions (submission_id, machine_id, product, patch, build_number, build_key, cdn_key, binary_hash, client_ip)
-				VALUES (${submission_id}, ${machine_id}, ${product}, ${patch}, ${build_number}, ${build_key}, ${cdn_key}, ${binary_hash}, ${client_ip})
+				VALUES (${submission_id}, ${machine_id}, ${product}, ${patch}, ${build_number}, ${build_key}, ${cdn_key}, ${binary_hash}, ${client_ip_hash})
 			`;
 
 			await db_archavon`INSERT INTO cache_submission_files ${db_archavon(file_rows)}`;
