@@ -104,7 +104,7 @@ export async function tact_load_keys(): Promise<void> {
 	const lines = data.split(/\r?\n/);
 	for (const line of lines) {
 		const key_name = line.substring(0, 16);
-		const key = line.substring(16, 32 + 16 + 1);
+		const key = line.substring(17).trim();
 		key_ring.set(key_name, key);
 	}
 
