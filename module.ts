@@ -57,6 +57,7 @@ type KinoQueueEntry = {
 };
 
 const kino_queue = new Map<Hash, KinoQueueEntry>();
+const kino_failed = new Set<Hash>();
 let kino_processing: Hash | null = null;
 
 function kino_is_valid_hash(str: string): boolean {
@@ -381,6 +382,7 @@ async function kino_process_video(entry: KinoQueueEntry, cache_key: string): Pro
 		await db`INSERT INTO kino_cached (enc) VALUES (${cache_key})`;
 	} catch (e) {
 		log(`kino: failed to process video ${e} ${JSON.stringify({ vid, aud, srt })}`);
+		kino_failed.add(cache_key);
 	} finally {
 		await fs.rm(temp_dir, { recursive: true, force: true });
 	}
@@ -1387,6 +1389,10 @@ export async function init(server: SpooderServer) {
 				url: kino_bucket.presign(cache_key)
 			};
 		}
+
+		// check if previously failed
+		if (kino_failed.has(cache_key))
+			return HTTP_STATUS_CODE.InternalServerError_500;
 
 		// check if already queued or processing
 		if (kino_queue.has(cache_key) || kino_processing === cache_key)
