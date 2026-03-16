@@ -540,6 +540,7 @@ async function cache_recover_pending() {
 		const pending = await db_archavon`
 			SELECT submission_id FROM cache_submissions
 			WHERE finalized_at IS NOT NULL
+			AND processed_at IS NULL
 		`;
 
 		for (const row of pending)

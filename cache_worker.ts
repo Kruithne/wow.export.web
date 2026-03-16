@@ -14,8 +14,25 @@ const WDB_STORE_MAP: Record<string, typeof store_creatures> = {
 	'WPTX': store_pagetext
 };
 
+const WDB_MAGIC_KEYS = new Set(Object.keys(WDB_STORE_MAP));
+const XFTH_MAGIC = 0x48544658;
+
 const queue: string[] = [];
 let processing = false;
+
+async function reject_file(file: { object_id: string; submission_id?: string }) {
+	try {
+		await cache_bucket.delete(file.object_id);
+	} catch (e) {
+		log(`failed to delete rejected CDN object {${file.object_id}}: ${(e as Error).message}`);
+	}
+
+	try {
+		await db_archavon`DELETE FROM cache_submission_files WHERE object_id = ${file.object_id}`;
+	} catch (e) {
+		log(`failed to delete rejected file row {${file.object_id}}: ${(e as Error).message}`);
+	}
+}
 
 declare var self: Worker;
 
@@ -97,7 +114,26 @@ async function process_submission(submission_id: string) {
 			const res = await cache_bucket.download(file.object_id);
 			const data = await res.arrayBuffer();
 
+			// magic validation before parsing
+			if (data.byteLength < 4) {
+				log(`file {${file.object_id}}: too small (${data.byteLength} bytes), rejecting`);
+				await reject_file(file);
+				continue;
+			}
+
+			const magic_view = new DataView(data);
+
 			if (file.file_name.endsWith('.wdb')) {
+				// wdb magic: 4 bytes reversed as ASCII, must match WDB_STORE_MAP keys
+				const magic_bytes = new Uint8Array(data, 0, 4);
+				const wdb_sig = String.fromCharCode(magic_bytes[3], magic_bytes[2], magic_bytes[1], magic_bytes[0]);
+
+				if (!WDB_MAGIC_KEYS.has(wdb_sig)) {
+					log(`wdb {${file.locale}/${file.file_name}}: invalid magic "${wdb_sig}", rejecting`);
+					await reject_file(file);
+					continue;
+				}
+
 				const result = parse_wdb(data, patch);
 				if (result) {
 					const valid_records = result.records.filter(r => !('parse_error' in r.data));
@@ -111,9 +147,17 @@ async function process_submission(submission_id: string) {
 						log(`wdb {${file.locale}/${file.file_name}}: unknown signature ${sig}, ${result.records.length} records skipped`);
 					}
 				} else {
-					log(`wdb {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
+					log(`wdb {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes), retaining file`);
 				}
 			} else if (file.file_name.toLowerCase() === 'dbcache.bin') {
+				const dbcache_magic = magic_view.getUint32(0, true);
+
+				if (dbcache_magic !== XFTH_MAGIC) {
+					log(`dbcache {${file.locale}/${file.file_name}}: invalid magic 0x${(dbcache_magic >>> 0).toString(16)}, rejecting`);
+					await reject_file(file);
+					continue;
+				}
+
 				const result = parse_dbcache(data);
 				if (result) {
 					log(`dbcache {${file.locale}/${file.file_name}}: ${result.entries.length} entries, build=${result.header.build}, version=${result.header.version}`);
@@ -150,7 +194,7 @@ async function process_submission(submission_id: string) {
 
 					log(`dbcache {${file.locale}/${file.file_name}}: stored {${inserted}} hotfix entries`);
 				} else {
-					log(`dbcache {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
+					log(`dbcache {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes), retaining file`);
 				}
 			}
 
@@ -159,16 +203,9 @@ async function process_submission(submission_id: string) {
 			log(`failed to download {${file.object_id}}: ${(e as Error).message}`);
 			failed++;
 		}
-
-		try {
-			await cache_bucket.delete(file.object_id);
-		} catch (e) {
-			log(`failed to delete CDN object {${file.object_id}}: ${(e as Error).message}`);
-		}
 	}
 
-	await db_archavon`DELETE FROM cache_submission_files WHERE submission_id = ${submission_id}`;
-	await db_archavon`DELETE FROM cache_submissions WHERE submission_id = ${submission_id}`;
+	await db_archavon`UPDATE cache_submissions SET processed_at = NOW() WHERE submission_id = ${submission_id}`;
 
 	log(`submission {${submission_id}} done: ${processed} processed, ${failed} failed`);
 }
