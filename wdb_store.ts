@@ -2,6 +2,7 @@ import type { SQL } from 'bun';
 import type { WdbRecord, CreatureRecord, QuestRecord, GameObjectRecord, PageTextRecord } from './wdb';
 
 const BATCH_SIZE = 100;
+const CONSENSUS_THRESHOLD = 3;
 
 type EntityType = 'creature' | 'quest' | 'gameobject' | 'pagetext';
 
@@ -88,6 +89,30 @@ async function store_batch(
 		`UPDATE ${table_name} SET attestation_count = (SELECT COUNT(*) FROM wdb_attestations a WHERE a.entity_type = ? AND a.entry_id = ${table_name}.entry_id) WHERE entry_id IN (${id_placeholders})`,
 		[entity_type, ...entry_ids]
 	);
+
+	// promote entries that just crossed the consensus threshold
+	const candidates = await db.unsafe(
+		`SELECT entry_id, record_id, locale, game_build FROM ${table_name}
+		 WHERE entry_id IN (${id_placeholders}) AND attestation_count >= ? AND is_consensus = 0`,
+		[...entry_ids, CONSENSUS_THRESHOLD]
+	);
+
+	for (const c of candidates) {
+		await db.unsafe(
+			`UPDATE ${table_name} SET is_consensus = 0
+			 WHERE record_id = ? AND locale = ? AND is_consensus = 1 AND game_build <= ?`,
+			[c.record_id, c.locale, c.game_build]
+		);
+
+		await db.unsafe(
+			`UPDATE ${table_name} SET is_consensus = 1
+			 WHERE entry_id = ? AND NOT EXISTS (
+				 SELECT 1 FROM (SELECT 1 FROM ${table_name}
+				 WHERE record_id = ? AND locale = ? AND is_consensus = 1) t
+			 )`,
+			[c.entry_id, c.record_id, c.locale]
+		);
+	}
 }
 
 export async function store_creatures(db: SQL, records: WdbRecord[], locale: string, game_build: number, machine_id: string, submission_id: string): Promise<number> {
