@@ -430,6 +430,61 @@ const CACHE_ALLOWED_FILES = new Set([
 
 const CACHE_MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 
+const CACHE_RATE_WINDOW = 24 * 60 * 60 * 1000; // 24h
+const CACHE_RATE_MAX_MACHINE = 20;
+const CACHE_RATE_MAX_IP = 50;
+
+const cache_rate_machine: Map<string, number[]> = new Map();
+const cache_rate_ip: Map<string, number[]> = new Map();
+
+function check_rate_limit(map: Map<string, number[]>, key: string, max: number): boolean {
+	const now = Date.now();
+	const timestamps = map.get(key);
+
+	if (timestamps === undefined) {
+		map.set(key, [now]);
+		return false;
+	}
+
+	const recent = timestamps.filter(t => now - t < CACHE_RATE_WINDOW);
+	if (recent.length >= max) {
+		map.set(key, recent);
+		return true;
+	}
+
+	recent.push(now);
+	map.set(key, recent);
+	return false;
+}
+
+function get_client_ip(req: Request): string {
+	const forwarded = req.headers.get('x-forwarded-for');
+	if (forwarded)
+		return forwarded.split(',')[0].trim();
+
+	return req.headers.get('x-real-ip') ?? 'unknown';
+}
+
+// prune expired rate limit entries hourly
+setInterval(() => {
+	const now = Date.now();
+	for (const [key, ts] of cache_rate_machine) {
+		const recent = ts.filter(t => now - t < CACHE_RATE_WINDOW);
+		if (recent.length === 0)
+			cache_rate_machine.delete(key);
+		else
+			cache_rate_machine.set(key, recent);
+	}
+
+	for (const [key, ts] of cache_rate_ip) {
+		const recent = ts.filter(t => now - t < CACHE_RATE_WINDOW);
+		if (recent.length === 0)
+			cache_rate_ip.delete(key);
+		else
+			cache_rate_ip.set(key, recent);
+	}
+}, 60 * 60 * 1000);
+
 interface CacheSubmitPayload {
 	machine_id: string;
 	product: string;
@@ -1353,6 +1408,21 @@ export async function init(server: SpooderServer) {
 		if (!cache_is_valid_uuid(machine_id))
 			return HTTP_STATUS_CODE.BadRequest_400;
 
+		const client_ip = get_client_ip(req);
+
+		const [machine] = await db_archavon`
+			SELECT blocked FROM machines WHERE machine_id = ${machine_id}
+		`;
+
+		if (machine?.blocked)
+			return HTTP_STATUS_CODE.Forbidden_403;
+
+		if (check_rate_limit(cache_rate_machine, machine_id, CACHE_RATE_MAX_MACHINE))
+			return HTTP_STATUS_CODE.TooManyRequests_429;
+
+		if (check_rate_limit(cache_rate_ip, client_ip, CACHE_RATE_MAX_IP))
+			return HTTP_STATUS_CODE.TooManyRequests_429;
+
 		if (typeof product !== 'string' || !CACHE_ALLOWED_PRODUCTS.has(product))
 			return HTTP_STATUS_CODE.BadRequest_400;
 
@@ -1415,8 +1485,8 @@ export async function init(server: SpooderServer) {
 			}
 
 			await db_archavon`
-				INSERT INTO cache_submissions (submission_id, machine_id, product, patch, build_number, build_key, cdn_key, binary_hash)
-				VALUES (${submission_id}, ${machine_id}, ${product}, ${patch}, ${build_number}, ${build_key}, ${cdn_key}, ${binary_hash})
+				INSERT INTO cache_submissions (submission_id, machine_id, product, patch, build_number, build_key, cdn_key, binary_hash, client_ip)
+				VALUES (${submission_id}, ${machine_id}, ${product}, ${patch}, ${build_number}, ${build_key}, ${cdn_key}, ${binary_hash}, ${client_ip})
 			`;
 
 			await db_archavon`INSERT INTO cache_submission_files ${db_archavon(file_rows)}`;

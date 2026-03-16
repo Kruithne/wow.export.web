@@ -69,6 +69,20 @@ async function process_submission(submission_id: string) {
 
 	await upsert_machine(db_archavon, machine_id);
 
+	const [count_row] = await db_archavon`
+		SELECT COUNT(*) as cnt FROM cache_submissions
+		WHERE machine_id = ${machine_id}
+		AND submitted_at > NOW() - INTERVAL 1 DAY
+	`;
+
+	if (count_row.cnt > 200) {
+		await db_archavon`
+			UPDATE machines SET blocked = 1, block_reason = ${'auto: exceeded 200 submissions/day'}
+			WHERE machine_id = ${machine_id}
+		`;
+		log(`auto-blocked machine {${machine_id}}: ${count_row.cnt} submissions in 24h`);
+	}
+
 	const files = await db_archavon`
 		SELECT file_name, locale, object_id
 		FROM cache_submission_files
