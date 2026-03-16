@@ -4,6 +4,16 @@ import type { WdbRecord, CreatureRecord, QuestRecord, GameObjectRecord, PageText
 const BATCH_SIZE = 100;
 const CONSENSUS_THRESHOLD = 3;
 
+const MAX_CREATURE_DISPLAYS = 4;
+const MAX_QUEST_ITEMS = 6;
+const MAX_CURRENCY_IDS = 2;
+const MAX_QUEST_FLAGS = 4;
+const MAX_REWARD_DISPLAY_SPELLS = 4;
+const MAX_TREASURE_PICKER_IDS = 6;
+const MAX_VISUAL_EFFECTS = 4;
+const MAX_GAMEOBJECT_QUEST_ITEMS = 6;
+const GAME_DATA_SIZE = 35;
+
 type EntityType = 'creature' | 'quest' | 'gameobject' | 'pagetext';
 
 function stable_json(obj: unknown): string {
@@ -26,6 +36,13 @@ function compute_hash(data: unknown): string {
 	const hasher = new Bun.CryptoHasher('sha256');
 	hasher.update(stable_json(data));
 	return hasher.digest('hex');
+}
+
+function pad_array<T>(arr: T[], max: number, fill: T): T[] {
+	const result = arr.slice(0, max);
+	while (result.length < max)
+		result.push(fill);
+	return result;
 }
 
 export async function upsert_machine(db: SQL, machine_id: string): Promise<void> {
@@ -124,8 +141,16 @@ export async function store_creatures(db: SQL, records: WdbRecord[], locale: str
 		'movement_info_id', 'required_expansion', 'tracking_quest_id',
 		'vignette_id', 'creature_class_mask', 'creature_difficulty_id',
 		'widget_parent_set_id', 'widget_set_unit_condition_id',
-		'names', 'name_alts', 'flags', 'proxy_creature_ids',
-		'displays', 'quest_items', 'currency_ids'
+		'name_0', 'name_1', 'name_2', 'name_3',
+		'name_alt_0', 'name_alt_1', 'name_alt_2', 'name_alt_3',
+		'flag_0', 'flag_1',
+		'proxy_creature_id_0', 'proxy_creature_id_1',
+		'display_id_0', 'display_scale_0', 'display_probability_0',
+		'display_id_1', 'display_scale_1', 'display_probability_1',
+		'display_id_2', 'display_scale_2', 'display_probability_2',
+		'display_id_3', 'display_scale_3', 'display_probability_3',
+		'quest_item_0', 'quest_item_1', 'quest_item_2', 'quest_item_3', 'quest_item_4', 'quest_item_5',
+		'currency_id_0', 'currency_id_1'
 	];
 
 	let stored = 0;
@@ -134,6 +159,15 @@ export async function store_creatures(db: SQL, records: WdbRecord[], locale: str
 		const hashed: HashedRecord[] = batch.map(record => {
 			const d = record.data as CreatureRecord;
 			const hash = compute_hash(d);
+
+			const names = pad_array(d.names, 4, '');
+			const name_alts = pad_array(d.name_alts, 4, '');
+			const flags = pad_array(d.flags, 2, 0);
+			const proxy = pad_array(d.proxy_creature_ids, 2, 0);
+			const displays = pad_array(d.displays, MAX_CREATURE_DISPLAYS, { id: 0, scale: 0, probability: 0 });
+			const quest_items = pad_array(d.quest_items, MAX_QUEST_ITEMS, 0);
+			const currency_ids = pad_array(d.currency_ids, MAX_CURRENCY_IDS, 0);
+
 			return {
 				record_id: record.id,
 				hash,
@@ -145,10 +179,13 @@ export async function store_creatures(db: SQL, records: WdbRecord[], locale: str
 					d.movement_info_id, d.required_expansion, d.tracking_quest_id,
 					d.vignette_id, d.creature_class_mask, d.creature_difficulty_id,
 					d.widget_parent_set_id, d.widget_set_unit_condition_id,
-					JSON.stringify(d.names), JSON.stringify(d.name_alts),
-					JSON.stringify(d.flags), JSON.stringify(d.proxy_creature_ids),
-					JSON.stringify(d.displays), JSON.stringify(d.quest_items),
-					JSON.stringify(d.currency_ids)
+					...names,
+					...name_alts,
+					...flags,
+					...proxy,
+					...displays.flatMap(disp => [disp.id, disp.scale, disp.probability]),
+					...quest_items,
+					...currency_ids
 				]
 			};
 		});
@@ -182,14 +219,54 @@ export async function store_quests(db: SQL, records: WdbRecord[], locale: string
 		'expansion_id', 'managed_world_state_id', 'quest_session_bonus',
 		'quest_giver_creature_id',
 		'ready_for_translation', 'reset_by_scheduler',
-		'flags', 'reward_fixed_items', 'item_drop_items', 'reward_choice_items',
-		'faction_rewards', 'currency_rewards', 'reward_display_spells',
-		'treasure_picker_ids', 'treasure_picker_ids_2',
-		'objectives', 'conditional_quest_descriptions', 'conditional_quest_completions',
+		'flag_0', 'flag_1', 'flag_2', 'flag_3',
+		'reward_fixed_item_id_0', 'reward_fixed_item_qty_0',
+		'reward_fixed_item_id_1', 'reward_fixed_item_qty_1',
+		'reward_fixed_item_id_2', 'reward_fixed_item_qty_2',
+		'reward_fixed_item_id_3', 'reward_fixed_item_qty_3',
+		'item_drop_item_id_0', 'item_drop_item_qty_0',
+		'item_drop_item_id_1', 'item_drop_item_qty_1',
+		'item_drop_item_id_2', 'item_drop_item_qty_2',
+		'item_drop_item_id_3', 'item_drop_item_qty_3',
+		'reward_choice_item_id_0', 'reward_choice_item_qty_0', 'reward_choice_item_display_id_0',
+		'reward_choice_item_id_1', 'reward_choice_item_qty_1', 'reward_choice_item_display_id_1',
+		'reward_choice_item_id_2', 'reward_choice_item_qty_2', 'reward_choice_item_display_id_2',
+		'reward_choice_item_id_3', 'reward_choice_item_qty_3', 'reward_choice_item_display_id_3',
+		'reward_choice_item_id_4', 'reward_choice_item_qty_4', 'reward_choice_item_display_id_4',
+		'reward_choice_item_id_5', 'reward_choice_item_qty_5', 'reward_choice_item_display_id_5',
+		'faction_reward_id_0', 'faction_reward_value_0', 'faction_reward_override_0', 'faction_reward_max_rank_0',
+		'faction_reward_id_1', 'faction_reward_value_1', 'faction_reward_override_1', 'faction_reward_max_rank_1',
+		'faction_reward_id_2', 'faction_reward_value_2', 'faction_reward_override_2', 'faction_reward_max_rank_2',
+		'faction_reward_id_3', 'faction_reward_value_3', 'faction_reward_override_3', 'faction_reward_max_rank_3',
+		'faction_reward_id_4', 'faction_reward_value_4', 'faction_reward_override_4', 'faction_reward_max_rank_4',
+		'currency_reward_id_0', 'currency_reward_qty_0',
+		'currency_reward_id_1', 'currency_reward_qty_1',
+		'currency_reward_id_2', 'currency_reward_qty_2',
+		'currency_reward_id_3', 'currency_reward_qty_3',
+		'reward_display_spell_id_0', 'reward_display_spell_condition_0', 'reward_display_spell_type_0',
+		'reward_display_spell_id_1', 'reward_display_spell_condition_1', 'reward_display_spell_type_1',
+		'reward_display_spell_id_2', 'reward_display_spell_condition_2', 'reward_display_spell_type_2',
+		'reward_display_spell_id_3', 'reward_display_spell_condition_3', 'reward_display_spell_type_3',
+		'treasure_picker_id_0', 'treasure_picker_id_1', 'treasure_picker_id_2',
+		'treasure_picker_id_3', 'treasure_picker_id_4', 'treasure_picker_id_5',
+		'treasure_picker_id_2_0', 'treasure_picker_id_2_1', 'treasure_picker_id_2_2',
+		'treasure_picker_id_2_3', 'treasure_picker_id_2_4', 'treasure_picker_id_2_5',
 		'log_title', 'log_description', 'quest_description', 'area_description',
 		'portrait_giver_text', 'portrait_giver_name',
 		'portrait_turn_in_text', 'portrait_turn_in_name',
 		'quest_completion_log'
+	];
+
+	const obj_columns = [
+		'quest_entry_id', 'objective_index',
+		'objective_id', 'type', 'storage_index', 'object_id', 'amount',
+		'flags', 'flags2', 'percent_amount', 'description',
+		'visual_effect_0', 'visual_effect_1', 'visual_effect_2', 'visual_effect_3'
+	];
+
+	const cond_columns = [
+		'quest_entry_id', 'text_type', 'text_index',
+		'player_condition_id', 'quest_giver_creature_id', 'text'
 	];
 
 	let stored = 0;
@@ -198,6 +275,17 @@ export async function store_quests(db: SQL, records: WdbRecord[], locale: string
 		const hashed: HashedRecord[] = batch.map(record => {
 			const d = record.data as QuestRecord;
 			const hash = compute_hash(d);
+
+			const flags = pad_array(d.flags, MAX_QUEST_FLAGS, 0);
+			const rfi = pad_array(d.reward_fixed_items, 4, { item_id: 0, quantity: 0 });
+			const idi = pad_array(d.item_drop_items, 4, { item_id: 0, quantity: 0 });
+			const rci = pad_array(d.reward_choice_items, 6, { item_id: 0, quantity: 0, display_id: 0 });
+			const fr = pad_array(d.faction_rewards, 5, { faction_id: 0, value: 0, override: 0, gain_max_rank: 0 });
+			const cr = pad_array(d.currency_rewards, 4, { currency_id: 0, quantity: 0 });
+			const rds = pad_array(d.reward_display_spells, MAX_REWARD_DISPLAY_SPELLS, { spell_id: 0, player_condition_id: 0, spell_type: 0 });
+			const tpi = pad_array(d.treasure_picker_ids, MAX_TREASURE_PICKER_IDS, 0);
+			const tpi2 = pad_array(d.treasure_picker_ids_2, MAX_TREASURE_PICKER_IDS, 0);
+
 			return {
 				record_id: record.id,
 				hash,
@@ -222,14 +310,15 @@ export async function store_quests(db: SQL, records: WdbRecord[], locale: string
 					d.expansion_id, d.managed_world_state_id, d.quest_session_bonus,
 					d.quest_giver_creature_id,
 					d.ready_for_translation, d.reset_by_scheduler,
-					JSON.stringify(d.flags), JSON.stringify(d.reward_fixed_items),
-					JSON.stringify(d.item_drop_items), JSON.stringify(d.reward_choice_items),
-					JSON.stringify(d.faction_rewards), JSON.stringify(d.currency_rewards),
-					JSON.stringify(d.reward_display_spells),
-					JSON.stringify(d.treasure_picker_ids), JSON.stringify(d.treasure_picker_ids_2),
-					JSON.stringify(d.objectives),
-					JSON.stringify(d.conditional_quest_descriptions),
-					JSON.stringify(d.conditional_quest_completions),
+					...flags,
+					...rfi.flatMap(x => [x.item_id, x.quantity]),
+					...idi.flatMap(x => [x.item_id, x.quantity]),
+					...rci.flatMap(x => [x.item_id, x.quantity, x.display_id]),
+					...fr.flatMap(x => [x.faction_id, x.value, x.override, x.gain_max_rank]),
+					...cr.flatMap(x => [x.currency_id, x.quantity]),
+					...rds.flatMap(x => [x.spell_id, x.player_condition_id, x.spell_type]),
+					...tpi,
+					...tpi2,
 					d.log_title, d.log_description, d.quest_description, d.area_description,
 					d.portrait_giver_text, d.portrait_giver_name,
 					d.portrait_turn_in_text, d.portrait_turn_in_name,
@@ -239,6 +328,65 @@ export async function store_quests(db: SQL, records: WdbRecord[], locale: string
 		});
 
 		await store_batch(db, 'quest', 'cache_quests', columns, hashed, locale, machine_id, submission_id);
+
+		// insert junction table rows for objectives and conditional texts
+		const tuple_placeholders = batch.map(() => '(?, ?, ?)').join(', ');
+		const tuple_params = hashed.flatMap(r => [r.record_id, locale, r.hash]);
+
+		const entries = await db.unsafe(
+			`SELECT entry_id, record_id, content_hash FROM cache_quests WHERE (record_id, locale, content_hash) IN (${tuple_placeholders})`,
+			tuple_params
+		);
+
+		const entry_map = new Map<string, number>();
+		for (const e of entries)
+			entry_map.set(`${e.record_id}:${e.content_hash}`, Number(e.entry_id));
+
+		for (let j = 0; j < batch.length; j++) {
+			const d = batch[j]!.data as QuestRecord;
+			const h = hashed[j]!;
+			const entry_id = entry_map.get(`${h.record_id}:${h.hash}`);
+			if (entry_id === undefined)
+				continue;
+
+			// objectives
+			if (d.objectives.length > 0) {
+				const obj_placeholder = `(${obj_columns.map(() => '?').join(', ')})`;
+				const obj_placeholders = d.objectives.map(() => obj_placeholder).join(', ');
+				const obj_params = d.objectives.flatMap((obj, idx) => {
+					const ve = pad_array(obj.visual_effects, MAX_VISUAL_EFFECTS, 0);
+					return [entry_id, idx, obj.id, obj.type, obj.storage_index, obj.object_id, obj.amount, obj.flags, obj.flags2, obj.percent_amount, obj.description, ...ve];
+				});
+
+				await db.unsafe(
+					`INSERT IGNORE INTO cache_quest_objectives (${obj_columns.join(', ')}) VALUES ${obj_placeholders}`,
+					obj_params
+				);
+			}
+
+			// conditional texts
+			const cond_texts: unknown[][] = [];
+			for (let ci = 0; ci < d.conditional_quest_descriptions.length; ci++) {
+				const ct = d.conditional_quest_descriptions[ci]!;
+				cond_texts.push([entry_id, 'description', ci, ct.player_condition_id, ct.quest_giver_creature_id, ct.text]);
+			}
+			for (let ci = 0; ci < d.conditional_quest_completions.length; ci++) {
+				const ct = d.conditional_quest_completions[ci]!;
+				cond_texts.push([entry_id, 'completion', ci, ct.player_condition_id, ct.quest_giver_creature_id, ct.text]);
+			}
+
+			if (cond_texts.length > 0) {
+				const cond_placeholder = `(${cond_columns.map(() => '?').join(', ')})`;
+				const cond_placeholders = cond_texts.map(() => cond_placeholder).join(', ');
+				const cond_params = cond_texts.flat();
+
+				await db.unsafe(
+					`INSERT IGNORE INTO cache_quest_conditional_texts (${cond_columns.join(', ')}) VALUES ${cond_placeholders}`,
+					cond_params
+				);
+			}
+		}
+
 		stored += batch.length;
 	}
 
@@ -249,7 +397,9 @@ export async function store_gameobjects(db: SQL, records: WdbRecord[], locale: s
 	const columns = [
 		'record_id', 'locale', 'content_hash', 'game_build',
 		'type', 'display_id', 'icon', 'action', '`condition`', 'scale', 'content_tuning_id',
-		'names', 'game_data', 'quest_items'
+		'name_0', 'name_1', 'name_2', 'name_3',
+		...Array.from({ length: GAME_DATA_SIZE }, (_, i) => `game_data_${i}`),
+		'quest_item_0', 'quest_item_1', 'quest_item_2', 'quest_item_3', 'quest_item_4', 'quest_item_5'
 	];
 
 	let stored = 0;
@@ -258,13 +408,20 @@ export async function store_gameobjects(db: SQL, records: WdbRecord[], locale: s
 		const hashed: HashedRecord[] = batch.map(record => {
 			const d = record.data as GameObjectRecord;
 			const hash = compute_hash(d);
+
+			const names = pad_array(d.names, 4, '');
+			const game_data = pad_array(d.game_data, GAME_DATA_SIZE, 0);
+			const quest_items = pad_array(d.quest_items, MAX_GAMEOBJECT_QUEST_ITEMS, 0);
+
 			return {
 				record_id: record.id,
 				hash,
 				params: [
 					record.id, locale, hash, game_build,
 					d.type, d.display_id, d.icon, d.action, d.condition, d.scale, d.content_tuning_id,
-					JSON.stringify(d.names), JSON.stringify(d.game_data), JSON.stringify(d.quest_items)
+					...names,
+					...game_data,
+					...quest_items
 				]
 			};
 		});
