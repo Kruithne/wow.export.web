@@ -416,10 +416,16 @@ cache_worker.onmessage = (event: MessageEvent) => {
 };
 
 const CACHE_ALLOWED_PRODUCTS = new Set([
-	'wow', 'wowt', 'wow_beta',
-	'wow_classic', 'wow_classic_era', 'wow_classic_beta',
-	'wow_classic_ptr', 'wow_classic_era_ptr',
-	'wow_classic_titan', 'wow_anniversary'
+	'wow',
+	//'wowt',
+	//'wow_beta',
+	'wow_classic',
+	'wow_classic_era',
+	//'wow_classic_beta',
+	//'wow_classic_ptr',
+	//'wow_classic_era_ptr',
+	'wow_classic_titan',
+	'wow_anniversary'
 ]);
 
 const CACHE_ALLOWED_FILES = new Set([
