@@ -12,6 +12,7 @@ import { tact_load_keys } from './casc/tact';
 import { bucket } from './obj_rds';
 import { sbt_to_srt } from './subtitles';
 import { sstrhash } from './sstrhash';
+import BufferReader from './buffer';
 
 const LISTFILE_HASH_THRESHOLD = 100;
 
@@ -500,7 +501,7 @@ interface CacheSubmitPayload {
 	build_number: number;
 	build_key: string;
 	cdn_key: string;
-	binary_hash: string;
+	binary_hashes: Record<string, string>;
 	files: Array<{ name: string; locale: string; size: number }>;
 }
 
@@ -567,6 +568,84 @@ function cache_is_valid_hex(str: unknown, len: number): boolean {
 
 function cache_is_valid_uuid(str: unknown): boolean {
 	return typeof str === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(str);
+}
+
+async function cache_fetch_build_hashes(build_key: string): Promise<void> {
+	const existing = await db_archavon`
+		SELECT 1 FROM cache_binary_hashes WHERE build_key = ${build_key} LIMIT 1
+	`;
+
+	if (existing.length > 0)
+		return;
+
+	try {
+		const config_res = await casc_download(casc_url_join(casc_cdn_path, 'config', casc_format_key(build_key)));
+		const config_text = await config_res.text();
+
+		let install_encoding_hash: string | null = null;
+		for (const line of config_text.split('\n')) {
+			const trimmed = line.trim();
+			if (trimmed.startsWith('install')) {
+				const parts = trimmed.split(/\s*=\s*/);
+				if (parts.length >= 2) {
+					const hashes = parts[1]!.trim().split(/\s+/);
+					if (hashes.length >= 2)
+						install_encoding_hash = hashes[1]!;
+				}
+				break;
+			}
+		}
+
+		if (!install_encoding_hash)
+			return;
+
+		const data_res = await casc_download_data(install_encoding_hash);
+		const raw_data = await data_res.arrayBuffer();
+		const unpacked = blte_unpack(raw_data, install_encoding_hash, false);
+		const reader = new BufferReader(unpacked);
+
+		const signature = reader.readUInt16LE();
+		if (signature !== 0x4E49)
+			return;
+
+		reader.readUInt8(); // version
+		const hash_size = reader.readUInt8();
+		const num_tags = reader.readUInt16BE();
+		const num_files = reader.readUInt32BE();
+		const mask_size = Math.ceil(num_files / 8);
+
+		// skip tags
+		for (let i = 0; i < num_tags; i++) {
+			reader.readNullTermString();
+			reader.readUInt16BE();
+			reader.move(mask_size);
+		}
+
+		// read files
+		const executables: Array<{ file_name: string; content_hash: string; file_size: number }> = [];
+		for (let i = 0; i < num_files; i++) {
+			const name = reader.readNullTermString();
+			const hash = reader.readHexString(hash_size);
+			const size = reader.readUInt32BE();
+
+			if (name.endsWith('.exe') || name.includes('.app/'))
+				executables.push({ file_name: name, content_hash: hash, file_size: size });
+		}
+
+		if (executables.length === 0)
+			return;
+
+		const rows = executables.map(e => ({
+			build_key,
+			file_name: e.file_name,
+			content_hash: e.content_hash,
+			file_size: e.file_size
+		}));
+
+		await db_archavon`INSERT INTO cache_binary_hashes ${db_archavon(rows)}`;
+	} catch (e) {
+		caution('cache: failed to fetch build hashes', { build_key, error: e });
+	}
 }
 // endregion
 
@@ -1416,7 +1495,7 @@ export async function init(server: SpooderServer) {
 		if (!req.headers.get('user-agent')?.startsWith('wow.export'))
 			return HTTP_STATUS_CODE.Forbidden_403;
 
-		const { machine_id, product, patch, build_number, build_key, cdn_key, binary_hash, files } = json as unknown as CacheSubmitPayload;
+		const { machine_id, product, patch, build_number, build_key, cdn_key, binary_hashes, files } = json as unknown as CacheSubmitPayload;
 
 		if (!cache_is_valid_uuid(machine_id))
 			return HTTP_STATUS_CODE.BadRequest_400;
@@ -1451,8 +1530,16 @@ export async function init(server: SpooderServer) {
 		if (!cache_is_valid_hex(cdn_key, 32))
 			return HTTP_STATUS_CODE.BadRequest_400;
 
-		if (!cache_is_valid_hex(binary_hash, 64))
+		if (typeof binary_hashes !== 'object' || binary_hashes === null || Array.isArray(binary_hashes))
 			return HTTP_STATUS_CODE.BadRequest_400;
+
+		for (const [name, hash] of Object.entries(binary_hashes)) {
+			if (typeof name !== 'string' || name.length === 0 || name.length > 64)
+				return HTTP_STATUS_CODE.BadRequest_400;
+
+			if (!cache_is_valid_hex(hash, 32))
+				return HTTP_STATUS_CODE.BadRequest_400;
+		}
 
 		if (!Array.isArray(files) || files.length === 0)
 			return HTTP_STATUS_CODE.BadRequest_400;
@@ -1469,6 +1556,34 @@ export async function init(server: SpooderServer) {
 
 			if (!Number.isInteger(file.size) || file.size <= 32 || file.size > CACHE_MAX_FILE_SIZE)
 				return HTTP_STATUS_CODE.BadRequest_400;
+		}
+
+		await casc_ready;
+		await cache_fetch_build_hashes(build_key);
+
+		const submitted_names = Object.keys(binary_hashes);
+		if (submitted_names.length > 0) {
+			const known_hashes = await db_archavon`
+				SELECT file_name, content_hash FROM cache_binary_hashes
+				WHERE build_key = ${build_key} AND file_name IN ${db_archavon(submitted_names)}
+			`;
+
+			// group known hashes by file_name (duplicates exist for multi-arch builds)
+			const valid_hashes = new Map<string, Set<string>>();
+			for (const row of known_hashes) {
+				let set = valid_hashes.get(row.file_name);
+				if (!set) {
+					set = new Set();
+					valid_hashes.set(row.file_name, set);
+				}
+				set.add(row.content_hash);
+			}
+
+			// reject if any matched file has a hash not in the known set
+			for (const [name, set] of valid_hashes) {
+				if (!set.has(binary_hashes[name]!))
+					return HTTP_STATUS_CODE.Forbidden_403;
+			}
 		}
 
 		const submission_id = crypto.randomUUID();
@@ -1499,9 +1614,11 @@ export async function init(server: SpooderServer) {
 
 			const client_ip_hash = crypto.createHash('sha256').update(client_ip).digest('hex');
 
+			const binary_hash_json = JSON.stringify(binary_hashes);
+
 			await db_archavon`
 				INSERT INTO cache_submissions (submission_id, machine_id, product, patch, build_number, build_key, cdn_key, binary_hash, client_ip)
-				VALUES (${submission_id}, ${machine_id}, ${product}, ${patch}, ${build_number}, ${build_key}, ${cdn_key}, ${binary_hash}, ${client_ip_hash})
+				VALUES (${submission_id}, ${machine_id}, ${product}, ${patch}, ${build_number}, ${build_key}, ${cdn_key}, ${binary_hash_json}, ${client_ip_hash})
 			`;
 
 			await db_archavon`INSERT INTO cache_submission_files ${db_archavon(file_rows)}`;

@@ -92,6 +92,12 @@ export default class BufferReader {
 		return value;
 	}
 
+	readUInt16BE(): number {
+		const value = this.view.getUint16(this._offset, false);
+		this._offset += 2;
+		return value;
+	}
+
 	readInt16BE(): number {
 		const value = this.view.getInt16(this._offset, false);
 		this._offset += 2;
