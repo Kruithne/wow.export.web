@@ -117,7 +117,7 @@ async function store_batch(
 			WHERE a.entity_type = ? AND a.entry_id = t.entry_id
 			AND a.attested_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
 		) WHERE (record_id, locale, product) IN (
-			SELECT record_id, locale, product FROM ${table_name} WHERE entry_id IN (${id_placeholders})
+			SELECT record_id, locale, product FROM (SELECT record_id, locale, product FROM ${table_name} WHERE entry_id IN (${id_placeholders})) sub
 		) AND entry_id NOT IN (${id_placeholders})`,
 		[entity_type, ...entry_ids, ...entry_ids]
 	);
