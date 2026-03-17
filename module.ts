@@ -416,18 +416,7 @@ cache_worker.onmessage = (event: MessageEvent) => {
 		log(`cache ${text}`);
 };
 
-const CACHE_ALLOWED_PRODUCTS = new Set([
-	'wow',
-	//'wowt',
-	//'wow_beta',
-	'wow_classic',
-	'wow_classic_era',
-	//'wow_classic_beta',
-	//'wow_classic_ptr',
-	//'wow_classic_era_ptr',
-	'wow_classic_titan',
-	'wow_anniversary'
-]);
+const CACHE_PRODUCT_PATTERN = /^[a-z_]+$/;
 
 const CACHE_ALLOWED_FILES = new Set([
 	'creaturecache.wdb',
@@ -1515,7 +1504,7 @@ export async function init(server: SpooderServer) {
 		if (check_rate_limit(cache_rate_ip, client_ip, CACHE_RATE_MAX_IP))
 			return HTTP_STATUS_CODE.TooManyRequests_429;
 
-		if (typeof product !== 'string' || !CACHE_ALLOWED_PRODUCTS.has(product))
+		if (typeof product !== 'string' || product.length === 0 || product.length > 32 || !CACHE_PRODUCT_PATTERN.test(product))
 			return HTTP_STATUS_CODE.BadRequest_400;
 
 		if (typeof patch !== 'string' || patch.length === 0 || patch.length > 16)
