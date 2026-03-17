@@ -65,6 +65,7 @@ async function store_batch(
 	columns: string[],
 	records: HashedRecord[],
 	locale: string,
+	product: string,
 	machine_id: string,
 	submission_id: string
 ): Promise<void> {
@@ -80,11 +81,11 @@ async function store_batch(
 		params
 	);
 
-	const tuple_placeholders = records.map(() => '(?, ?, ?)').join(', ');
-	const tuple_params = records.flatMap(r => [r.record_id, locale, r.hash]);
+	const tuple_placeholders = records.map(() => '(?, ?, ?, ?)').join(', ');
+	const tuple_params = records.flatMap(r => [r.record_id, locale, r.hash, product]);
 
 	const entries = await db.unsafe(
-		`SELECT entry_id FROM ${table_name} WHERE (record_id, locale, content_hash) IN (${tuple_placeholders})`,
+		`SELECT entry_id FROM ${table_name} WHERE (record_id, locale, content_hash, product) IN (${tuple_placeholders})`,
 		tuple_params
 	);
 
@@ -109,14 +110,14 @@ async function store_batch(
 		[entity_type, ...entry_ids]
 	);
 
-	// recount sibling entries (same record_id/locale) to reflect expired attestations
+	// recount sibling entries (same record_id/locale/product) to reflect expired attestations
 	await db.unsafe(
 		`UPDATE ${table_name} t SET attestation_count = (
 			SELECT COUNT(*) FROM wdb_attestations a
 			WHERE a.entity_type = ? AND a.entry_id = t.entry_id
 			AND a.attested_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-		) WHERE (record_id, locale) IN (
-			SELECT record_id, locale FROM ${table_name} WHERE entry_id IN (${id_placeholders})
+		) WHERE (record_id, locale, product) IN (
+			SELECT record_id, locale, product FROM ${table_name} WHERE entry_id IN (${id_placeholders})
 		) AND entry_id NOT IN (${id_placeholders})`,
 		[entity_type, ...entry_ids, ...entry_ids]
 	);
@@ -125,9 +126,9 @@ async function store_batch(
 	await db.unsafe(
 		`UPDATE ${table_name} SET is_consensus = 0
 		 WHERE is_consensus = 1 AND attestation_count < ?
-		 AND (record_id, locale) IN (
-			 SELECT record_id, locale FROM (
-				 SELECT record_id, locale FROM ${table_name} WHERE entry_id IN (${id_placeholders})
+		 AND (record_id, locale, product) IN (
+			 SELECT record_id, locale, product FROM (
+				 SELECT record_id, locale, product FROM ${table_name} WHERE entry_id IN (${id_placeholders})
 			 ) sub
 		 )`,
 		[CONSENSUS_THRESHOLD, ...entry_ids]
@@ -135,7 +136,7 @@ async function store_batch(
 
 	// promote entries that just crossed the consensus threshold
 	const candidates = await db.unsafe(
-		`SELECT entry_id, record_id, locale, game_build FROM ${table_name}
+		`SELECT entry_id, record_id, locale, product, game_build FROM ${table_name}
 		 WHERE entry_id IN (${id_placeholders}) AND attestation_count >= ? AND is_consensus = 0`,
 		[...entry_ids, CONSENSUS_THRESHOLD]
 	);
@@ -143,24 +144,24 @@ async function store_batch(
 	for (const c of candidates) {
 		await db.unsafe(
 			`UPDATE ${table_name} SET is_consensus = 0
-			 WHERE record_id = ? AND locale = ? AND is_consensus = 1 AND game_build <= ?`,
-			[c.record_id, c.locale, c.game_build]
+			 WHERE record_id = ? AND locale = ? AND product = ? AND is_consensus = 1 AND game_build <= ?`,
+			[c.record_id, c.locale, c.product, c.game_build]
 		);
 
 		await db.unsafe(
 			`UPDATE ${table_name} SET is_consensus = 1
 			 WHERE entry_id = ? AND NOT EXISTS (
 				 SELECT 1 FROM (SELECT 1 FROM ${table_name}
-				 WHERE record_id = ? AND locale = ? AND is_consensus = 1) t
+				 WHERE record_id = ? AND locale = ? AND product = ? AND is_consensus = 1) t
 			 )`,
-			[c.entry_id, c.record_id, c.locale]
+			[c.entry_id, c.record_id, c.locale, c.product]
 		);
 	}
 }
 
-export async function store_creatures(db: SQL, records: WdbRecord[], locale: string, game_build: number, machine_id: string, submission_id: string): Promise<number> {
+export async function store_creatures(db: SQL, records: WdbRecord[], locale: string, product: string, game_build: number, machine_id: string, submission_id: string): Promise<number> {
 	const columns = [
-		'record_id', 'locale', 'content_hash', 'game_build',
+		'record_id', 'locale', 'content_hash', 'product', 'game_build',
 		'title', 'title_alt', 'cursor_name', 'leader',
 		'creature_type', 'creature_family', 'classification',
 		'num_displays', 'total_probability', 'hp_multiplier', 'energy_multiplier',
@@ -198,7 +199,7 @@ export async function store_creatures(db: SQL, records: WdbRecord[], locale: str
 				record_id: record.id,
 				hash,
 				params: [
-					record.id, locale, hash, game_build,
+					record.id, locale, hash, product, game_build,
 					d.title, d.title_alt, d.cursor_name, d.leader,
 					d.creature_type, d.creature_family, d.classification,
 					d.num_displays, d.total_probability, d.hp_multiplier, d.energy_multiplier,
@@ -216,16 +217,16 @@ export async function store_creatures(db: SQL, records: WdbRecord[], locale: str
 			};
 		});
 
-		await store_batch(db, 'creature', 'cache_creatures', columns, hashed, locale, machine_id, submission_id);
+		await store_batch(db, 'creature', 'cache_creatures', columns, hashed, locale, product, machine_id, submission_id);
 		stored += batch.length;
 	}
 
 	return stored;
 }
 
-export async function store_quests(db: SQL, records: WdbRecord[], locale: string, game_build: number, machine_id: string, submission_id: string): Promise<number> {
+export async function store_quests(db: SQL, records: WdbRecord[], locale: string, product: string, game_build: number, machine_id: string, submission_id: string): Promise<number> {
 	const columns = [
-		'record_id', 'locale', 'content_hash', 'game_build',
+		'record_id', 'locale', 'content_hash', 'product', 'game_build',
 		'quest_type', 'quest_package_id', 'content_tuning_id', 'quest_sort_id',
 		'quest_info_id', 'suggested_group_num', 'reward_next_quest',
 		'reward_xp_difficulty', 'reward_xp_multiplier',
@@ -316,7 +317,7 @@ export async function store_quests(db: SQL, records: WdbRecord[], locale: string
 				record_id: record.id,
 				hash,
 				params: [
-					record.id, locale, hash, game_build,
+					record.id, locale, hash, product, game_build,
 					d.quest_type, d.quest_package_id, d.content_tuning_id, d.quest_sort_id,
 					d.quest_info_id, d.suggested_group_num, d.reward_next_quest,
 					d.reward_xp_difficulty, d.reward_xp_multiplier,
@@ -353,14 +354,14 @@ export async function store_quests(db: SQL, records: WdbRecord[], locale: string
 			};
 		});
 
-		await store_batch(db, 'quest', 'cache_quests', columns, hashed, locale, machine_id, submission_id);
+		await store_batch(db, 'quest', 'cache_quests', columns, hashed, locale, product, machine_id, submission_id);
 
 		// insert junction table rows for objectives and conditional texts
-		const tuple_placeholders = batch.map(() => '(?, ?, ?)').join(', ');
-		const tuple_params = hashed.flatMap(r => [r.record_id, locale, r.hash]);
+		const tuple_placeholders = batch.map(() => '(?, ?, ?, ?)').join(', ');
+		const tuple_params = hashed.flatMap(r => [r.record_id, locale, r.hash, product]);
 
 		const entries = await db.unsafe(
-			`SELECT entry_id, record_id, content_hash FROM cache_quests WHERE (record_id, locale, content_hash) IN (${tuple_placeholders})`,
+			`SELECT entry_id, record_id, content_hash FROM cache_quests WHERE (record_id, locale, content_hash, product) IN (${tuple_placeholders})`,
 			tuple_params
 		);
 
@@ -419,9 +420,9 @@ export async function store_quests(db: SQL, records: WdbRecord[], locale: string
 	return stored;
 }
 
-export async function store_gameobjects(db: SQL, records: WdbRecord[], locale: string, game_build: number, machine_id: string, submission_id: string): Promise<number> {
+export async function store_gameobjects(db: SQL, records: WdbRecord[], locale: string, product: string, game_build: number, machine_id: string, submission_id: string): Promise<number> {
 	const columns = [
-		'record_id', 'locale', 'content_hash', 'game_build',
+		'record_id', 'locale', 'content_hash', 'product', 'game_build',
 		'type', 'display_id', 'icon', 'action', '`condition`', 'scale', 'content_tuning_id',
 		'name_0', 'name_1', 'name_2', 'name_3',
 		...Array.from({ length: GAME_DATA_SIZE }, (_, i) => `game_data_${i}`),
@@ -443,7 +444,7 @@ export async function store_gameobjects(db: SQL, records: WdbRecord[], locale: s
 				record_id: record.id,
 				hash,
 				params: [
-					record.id, locale, hash, game_build,
+					record.id, locale, hash, product, game_build,
 					d.type, d.display_id, d.icon, d.action, d.condition, d.scale, d.content_tuning_id,
 					...names,
 					...game_data,
@@ -452,16 +453,16 @@ export async function store_gameobjects(db: SQL, records: WdbRecord[], locale: s
 			};
 		});
 
-		await store_batch(db, 'gameobject', 'cache_gameobjects', columns, hashed, locale, machine_id, submission_id);
+		await store_batch(db, 'gameobject', 'cache_gameobjects', columns, hashed, locale, product, machine_id, submission_id);
 		stored += batch.length;
 	}
 
 	return stored;
 }
 
-export async function store_pagetext(db: SQL, records: WdbRecord[], locale: string, game_build: number, machine_id: string, submission_id: string): Promise<number> {
+export async function store_pagetext(db: SQL, records: WdbRecord[], locale: string, product: string, game_build: number, machine_id: string, submission_id: string): Promise<number> {
 	const columns = [
-		'record_id', 'locale', 'content_hash', 'game_build',
+		'record_id', 'locale', 'content_hash', 'product', 'game_build',
 		'next_page_text_id', 'player_condition_id', 'flags', 'text'
 	];
 
@@ -475,13 +476,13 @@ export async function store_pagetext(db: SQL, records: WdbRecord[], locale: stri
 				record_id: record.id,
 				hash,
 				params: [
-					record.id, locale, hash, game_build,
+					record.id, locale, hash, product, game_build,
 					d.next_page_text_id, d.player_condition_id, d.flags, d.text
 				]
 			};
 		});
 
-		await store_batch(db, 'pagetext', 'cache_pagetext', columns, hashed, locale, machine_id, submission_id);
+		await store_batch(db, 'pagetext', 'cache_pagetext', columns, hashed, locale, product, machine_id, submission_id);
 		stored += batch.length;
 	}
 

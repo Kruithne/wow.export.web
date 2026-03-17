@@ -141,7 +141,7 @@ async function process_submission(submission_id: string) {
 					const sig = result.header.signature;
 					const store_fn = WDB_STORE_MAP[sig];
 					if (store_fn) {
-						const stored = await store_fn(db_archavon, valid_records, file.locale, build_number, machine_id, submission_id);
+						const stored = await store_fn(db_archavon, valid_records, file.locale, product, build_number, machine_id, submission_id);
 						log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, stored ${stored}, ${parse_errors} parse errors (${sig})`);
 					} else {
 						log(`wdb {${file.locale}/${file.file_name}}: unknown signature ${sig}, ${result.records.length} records skipped`);
