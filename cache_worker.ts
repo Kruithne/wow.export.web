@@ -185,7 +185,7 @@ async function process_submission(submission_id: string) {
 						}
 
 						await db_archavon.unsafe(
-							`INSERT IGNORE INTO hotfix_entries (table_hash, record_id, push_id, unique_id, region_id, status, game_build, data_blob) VALUES ${placeholders.join(',')}`,
+							`INSERT INTO hotfix_entries (table_hash, record_id, push_id, unique_id, region_id, status, game_build, data_blob) VALUES ${placeholders.join(',')} ON DUPLICATE KEY UPDATE unique_id = IF(VALUES(data_blob) IS NOT NULL AND data_blob IS NULL, VALUES(unique_id), unique_id), region_id = IF(VALUES(data_blob) IS NOT NULL AND data_blob IS NULL, VALUES(region_id), region_id), status = IF(VALUES(data_blob) IS NOT NULL AND data_blob IS NULL, VALUES(status), status), game_build = IF(VALUES(data_blob) IS NOT NULL AND data_blob IS NULL, VALUES(game_build), game_build), data_blob = IF(VALUES(data_blob) IS NOT NULL AND data_blob IS NULL, VALUES(data_blob), data_blob)`,
 							params
 						);
 
