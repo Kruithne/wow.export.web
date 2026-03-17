@@ -491,7 +491,7 @@ interface CacheSubmitPayload {
 	build_key: string;
 	cdn_key: string;
 	binary_hashes: Record<string, string>;
-	files: Array<{ name: string; locale: string; size: number }>;
+	files: Array<{ name: string; locale: string; size: number; modified_at: string }>;
 }
 
 interface CacheFinalizePayload {
@@ -1545,6 +1545,17 @@ export async function init(server: SpooderServer) {
 
 			if (!Number.isInteger(file.size) || file.size <= 32 || file.size > CACHE_MAX_FILE_SIZE)
 				return HTTP_STATUS_CODE.BadRequest_400;
+
+			if (typeof file.modified_at !== 'string')
+				return HTTP_STATUS_CODE.BadRequest_400;
+
+			const modified_time = new Date(file.modified_at);
+			if (isNaN(modified_time.getTime()))
+				return HTTP_STATUS_CODE.BadRequest_400;
+
+			const age_ms = Date.now() - modified_time.getTime();
+			if (age_ms > 30 * 24 * 60 * 60 * 1000 || age_ms < 0)
+				return HTTP_STATUS_CODE.BadRequest_400;
 		}
 
 		await casc_ready;
@@ -1580,7 +1591,7 @@ export async function init(server: SpooderServer) {
 
 		try {
 			const upload_urls: Record<string, string> = {};
-			const file_rows: Array<{ submission_id: string; file_name: string; locale: string; file_size: number; object_id: string }> = [];
+			const file_rows: Array<{ submission_id: string; file_name: string; locale: string; file_size: number; object_id: string; modified_at: Date }> = [];
 
 			for (const file of files) {
 				const file_key = `${file.locale}/${file.name}`;
@@ -1597,7 +1608,8 @@ export async function init(server: SpooderServer) {
 					file_name: file.name,
 					locale: file.locale,
 					file_size: file.size,
-					object_id
+					object_id,
+					modified_at: new Date(file.modified_at)
 				});
 			}
 

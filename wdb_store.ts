@@ -97,14 +97,40 @@ async function store_batch(
 	const att_params = entry_ids.flatMap((id: any) => [entity_type, id, machine_id, submission_id]);
 
 	await db.unsafe(
-		`INSERT IGNORE INTO wdb_attestations (entity_type, entry_id, machine_id, submission_id) VALUES ${att_placeholders}`,
+		`INSERT INTO wdb_attestations (entity_type, entry_id, machine_id, submission_id)
+		 VALUES ${att_placeholders}
+		 ON DUPLICATE KEY UPDATE attested_at = CURRENT_TIMESTAMP, submission_id = VALUES(submission_id)`,
 		att_params
 	);
 
 	const id_placeholders = entry_ids.map(() => '?').join(', ');
 	await db.unsafe(
-		`UPDATE ${table_name} SET attestation_count = (SELECT COUNT(*) FROM wdb_attestations a WHERE a.entity_type = ? AND a.entry_id = ${table_name}.entry_id) WHERE entry_id IN (${id_placeholders})`,
+		`UPDATE ${table_name} SET attestation_count = (SELECT COUNT(*) FROM wdb_attestations a WHERE a.entity_type = ? AND a.entry_id = ${table_name}.entry_id AND a.attested_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)) WHERE entry_id IN (${id_placeholders})`,
 		[entity_type, ...entry_ids]
+	);
+
+	// recount sibling entries (same record_id/locale) to reflect expired attestations
+	await db.unsafe(
+		`UPDATE ${table_name} t SET attestation_count = (
+			SELECT COUNT(*) FROM wdb_attestations a
+			WHERE a.entity_type = ? AND a.entry_id = t.entry_id
+			AND a.attested_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+		) WHERE (record_id, locale) IN (
+			SELECT record_id, locale FROM ${table_name} WHERE entry_id IN (${id_placeholders})
+		) AND entry_id NOT IN (${id_placeholders})`,
+		[entity_type, ...entry_ids, ...entry_ids]
+	);
+
+	// demote entries that dropped below consensus threshold
+	await db.unsafe(
+		`UPDATE ${table_name} SET is_consensus = 0
+		 WHERE is_consensus = 1 AND attestation_count < ?
+		 AND (record_id, locale) IN (
+			 SELECT record_id, locale FROM (
+				 SELECT record_id, locale FROM ${table_name} WHERE entry_id IN (${id_placeholders})
+			 ) sub
+		 )`,
+		[CONSENSUS_THRESHOLD, ...entry_ids]
 	);
 
 	// promote entries that just crossed the consensus threshold
