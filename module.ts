@@ -1522,6 +1522,10 @@ export async function init(server: SpooderServer) {
 		if (typeof binary_hashes !== 'object' || binary_hashes === null || Array.isArray(binary_hashes))
 			return HTTP_STATUS_CODE.BadRequest_400;
 
+		const submitted_names = Object.keys(binary_hashes);
+		if (submitted_names.length === 0)
+			return HTTP_STATUS_CODE.BadRequest_400;
+
 		for (const [name, hash] of Object.entries(binary_hashes)) {
 			if (typeof name !== 'string' || name.length === 0 || name.length > 64)
 				return HTTP_STATUS_CODE.BadRequest_400;
@@ -1561,29 +1565,30 @@ export async function init(server: SpooderServer) {
 		await casc_ready;
 		await cache_fetch_build_hashes(build_key);
 
-		const submitted_names = Object.keys(binary_hashes);
-		if (submitted_names.length > 0) {
-			const known_hashes = await db_archavon`
-				SELECT file_name, content_hash FROM cache_binary_hashes
-				WHERE build_key = ${build_key} AND file_name IN ${db_archavon(submitted_names)}
-			`;
+		const known_hashes_rows = await db_archavon`
+			SELECT file_name, content_hash FROM cache_binary_hashes
+			WHERE build_key = ${build_key} AND file_name IN ${db_archavon(submitted_names)}
+		`;
 
-			// group known hashes by file_name (duplicates exist for multi-arch builds)
-			const valid_hashes = new Map<string, Set<string>>();
-			for (const row of known_hashes) {
-				let set = valid_hashes.get(row.file_name);
-				if (!set) {
-					set = new Set();
-					valid_hashes.set(row.file_name, set);
-				}
-				set.add(row.content_hash);
-			}
+		// no known hashes for this build, cannot verify
+		if (known_hashes_rows.length === 0)
+			return HTTP_STATUS_CODE.Forbidden_403;
 
-			// reject if any matched file has a hash not in the known set
-			for (const [name, set] of valid_hashes) {
-				if (!set.has(binary_hashes[name]!))
-					return HTTP_STATUS_CODE.Forbidden_403;
+		// group known hashes by file_name (duplicates exist for multi-arch builds)
+		const valid_hashes = new Map<string, Set<string>>();
+		for (const row of known_hashes_rows) {
+			let set = valid_hashes.get(row.file_name);
+			if (!set) {
+				set = new Set();
+				valid_hashes.set(row.file_name, set);
 			}
+			set.add(row.content_hash);
+		}
+
+		// reject if any matched file has a hash not in the known set
+		for (const [name, set] of valid_hashes) {
+			if (!set.has(binary_hashes[name]!))
+				return HTTP_STATUS_CODE.Forbidden_403;
 		}
 
 		const submission_id = crypto.randomUUID();
