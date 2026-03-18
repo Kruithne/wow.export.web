@@ -1684,7 +1684,7 @@ export async function init(server: SpooderServer) {
 			}
 
 			await db_archavon`
-				UPDATE cache_submissions SET finalized_at = NOW()
+				UPDATE cache_submissions SET finalized_at = NOW(), status = 'finalized'
 				WHERE submission_id = ${submission_id}
 			`;
 

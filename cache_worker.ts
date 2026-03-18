@@ -20,7 +20,7 @@ const XFTH_MAGIC = 0x48544658;
 const queue: string[] = [];
 let processing = false;
 
-async function reject_file(file: { object_id: string; submission_id?: string }) {
+async function reject_file(file: { object_id: string }, reason: string) {
 	try {
 		await cache_bucket.delete(file.object_id);
 	} catch (e) {
@@ -28,9 +28,9 @@ async function reject_file(file: { object_id: string; submission_id?: string }) 
 	}
 
 	try {
-		await db_archavon`DELETE FROM cache_submission_files WHERE object_id = ${file.object_id}`;
+		await db_archavon`UPDATE cache_submission_files SET status = 'rejected', failure_reason = ${reason} WHERE object_id = ${file.object_id}`;
 	} catch (e) {
-		log(`failed to delete rejected file row {${file.object_id}}: ${(e as Error).message}`);
+		log(`failed to update rejected file row {${file.object_id}}: ${(e as Error).message}`);
 	}
 }
 
@@ -65,6 +65,14 @@ async function process_queue() {
 	processing = false;
 }
 
+async function update_file_status(object_id: string, status: string, failure_reason: string | null, records_added: number) {
+	await db_archavon`
+		UPDATE cache_submission_files
+		SET status = ${status}, failure_reason = ${failure_reason}, records_added = ${records_added}
+		WHERE object_id = ${object_id}
+	`;
+}
+
 async function process_submission(submission_id: string) {
 	const [submission] = await db_archavon`
 		SELECT build_number, machine_id, patch, product
@@ -84,6 +92,7 @@ async function process_submission(submission_id: string) {
 
 	log(`submission {${submission_id}} ${product} ${patch}.${build_number} (machine: ${machine_id})`);
 
+	await db_archavon`UPDATE cache_submissions SET status = 'processing' WHERE submission_id = ${submission_id}`;
 	await upsert_machine(db_archavon, machine_id);
 
 	const files = await db_archavon`
@@ -92,31 +101,34 @@ async function process_submission(submission_id: string) {
 		WHERE submission_id = ${submission_id}
 	`;
 
-	let processed = 0;
-	let failed = 0;
+	let completed = 0;
+	let rejected = 0;
+	const rejection_reasons: string[] = [];
 
 	for (const file of files) {
 		try {
 			const res = await cache_bucket.download(file.object_id);
 			const data = await res.arrayBuffer();
 
-			// magic validation before parsing
 			if (data.byteLength < 4) {
 				log(`file {${file.object_id}}: too small (${data.byteLength} bytes), rejecting`);
-				await reject_file(file);
+				await reject_file(file, 'parse_error');
+				rejected++;
+				rejection_reasons.push('parse_error');
 				continue;
 			}
 
 			const magic_view = new DataView(data);
 
 			if (file.file_name.endsWith('.wdb')) {
-				// wdb magic: 4 bytes reversed as ASCII, must match WDB_STORE_MAP keys
 				const magic_bytes = new Uint8Array(data, 0, 4);
 				const wdb_sig = String.fromCharCode(magic_bytes[3], magic_bytes[2], magic_bytes[1], magic_bytes[0]);
 
 				if (!WDB_MAGIC_KEYS.has(wdb_sig)) {
 					log(`wdb {${file.locale}/${file.file_name}}: invalid magic "${wdb_sig}", rejecting`);
-					await reject_file(file);
+					await reject_file(file, 'invalid_magic');
+					rejected++;
+					rejection_reasons.push('invalid_magic');
 					continue;
 				}
 
@@ -129,18 +141,28 @@ async function process_submission(submission_id: string) {
 					if (store_fn) {
 						const stored = await store_fn(db_archavon, valid_records, file.locale, product, build_number, machine_id, submission_id);
 						log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, stored ${stored}, ${parse_errors} parse errors (${sig})`);
+						await update_file_status(file.object_id, 'completed', null, stored);
+						completed++;
 					} else {
 						log(`wdb {${file.locale}/${file.file_name}}: unknown signature ${sig}, ${result.records.length} records skipped`);
+						await reject_file(file, 'unknown_signature');
+						rejected++;
+						rejection_reasons.push('unknown_signature');
 					}
 				} else {
-					log(`wdb {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes), retaining file`);
+					log(`wdb {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
+					await reject_file(file, 'parse_error');
+					rejected++;
+					rejection_reasons.push('parse_error');
 				}
 			} else if (file.file_name.toLowerCase() === 'dbcache.bin') {
 				const dbcache_magic = magic_view.getUint32(0, true);
 
 				if (dbcache_magic !== XFTH_MAGIC) {
 					log(`dbcache {${file.locale}/${file.file_name}}: invalid magic 0x${(dbcache_magic >>> 0).toString(16)}, rejecting`);
-					await reject_file(file);
+					await reject_file(file, 'invalid_magic');
+					rejected++;
+					rejection_reasons.push('invalid_magic');
 					continue;
 				}
 
@@ -180,19 +202,44 @@ async function process_submission(submission_id: string) {
 					}
 
 					log(`dbcache {${file.locale}/${file.file_name}}: stored {${inserted}} hotfix entries`);
+					await update_file_status(file.object_id, 'completed', null, inserted);
+					completed++;
 				} else {
-					log(`dbcache {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes), retaining file`);
+					log(`dbcache {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
+					await reject_file(file, 'parse_error');
+					rejected++;
+					rejection_reasons.push('parse_error');
 				}
 			}
-
-			processed++;
 		} catch (e) {
 			log(`failed to download {${file.object_id}}: ${(e as Error).message}`);
-			failed++;
+			await update_file_status(file.object_id, 'rejected', 'download_failed', 0);
+			rejected++;
+			rejection_reasons.push('download_failed');
 		}
 	}
 
-	await db_archavon`UPDATE cache_submissions SET processed_at = NOW() WHERE submission_id = ${submission_id}`;
+	const total = completed + rejected;
+	let status: string;
+	let status_reason: string | null = null;
 
-	log(`submission {${submission_id}} done: ${processed} processed, ${failed} failed`);
+	if (rejected === 0)
+		status = 'completed';
+	else if (completed === 0)
+		status = 'failed';
+	else
+		status = 'partial';
+
+	if (rejected > 0) {
+		const unique_reasons = [...new Set(rejection_reasons)].join(', ');
+		status_reason = `${completed}/${total} files processed, ${rejected} rejected (${unique_reasons})`;
+	}
+
+	await db_archavon`
+		UPDATE cache_submissions
+		SET processed_at = NOW(), status = ${status}, status_reason = ${status_reason}
+		WHERE submission_id = ${submission_id}
+	`;
+
+	log(`submission {${submission_id}} done: ${completed} completed, ${rejected} rejected [${status}]`);
 }
