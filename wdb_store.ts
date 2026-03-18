@@ -124,7 +124,7 @@ async function store_batch(
 
 	// demote entries that dropped below consensus threshold
 	await db.unsafe(
-		`UPDATE ${table_name} SET is_consensus = 0
+		`UPDATE ${table_name} SET is_consensus = 0, consensus_at = CURRENT_TIMESTAMP
 		 WHERE is_consensus = 1 AND attestation_count < ?
 		 AND (record_id, locale, product) IN (
 			 SELECT record_id, locale, product FROM (
@@ -143,13 +143,13 @@ async function store_batch(
 
 	for (const c of candidates) {
 		await db.unsafe(
-			`UPDATE ${table_name} SET is_consensus = 0
+			`UPDATE ${table_name} SET is_consensus = 0, consensus_at = CURRENT_TIMESTAMP
 			 WHERE record_id = ? AND locale = ? AND product = ? AND is_consensus = 1 AND game_build <= ?`,
 			[c.record_id, c.locale, c.product, c.game_build]
 		);
 
 		await db.unsafe(
-			`UPDATE ${table_name} SET is_consensus = 1
+			`UPDATE ${table_name} SET is_consensus = 1, consensus_at = CURRENT_TIMESTAMP
 			 WHERE entry_id = ? AND NOT EXISTS (
 				 SELECT 1 FROM (SELECT 1 FROM ${table_name}
 				 WHERE record_id = ? AND locale = ? AND product = ? AND is_consensus = 1) t
