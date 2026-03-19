@@ -416,6 +416,16 @@ cache_worker.onmessage = (event: MessageEvent) => {
 		log(`cache ${text}`);
 };
 
+const FILTERED_BINARY_PATTERNS = [
+	/^blizzarderror\.exe$/i,
+	/(^|[/\\])utils[/\\]/i,
+	/Helpers\//i,
+];
+
+function is_filtered_binary(name: string): boolean {
+	return FILTERED_BINARY_PATTERNS.some(p => p.test(name));
+}
+
 const CACHE_PRODUCT_PATTERN = /^[a-z_]+$/;
 
 const CACHE_ALLOWED_FILES = new Set([
@@ -617,8 +627,12 @@ async function cache_fetch_build_hashes(build_key: string): Promise<void> {
 			const hash = reader.readHexString(hash_size);
 			const size = reader.readUInt32BE();
 
-			if (name.endsWith('.exe') || name.includes('.app/'))
+			if (name.endsWith('.exe') || name.includes('.app/')) {
+				if (is_filtered_binary(name))
+					continue;
+
 				executables.push({ file_name: name, content_hash: hash, file_size: size });
+			}
 		}
 
 		if (executables.length === 0)
@@ -1521,6 +1535,11 @@ export async function init(server: SpooderServer) {
 
 		if (typeof binary_hashes !== 'object' || binary_hashes === null || Array.isArray(binary_hashes))
 			return HTTP_STATUS_CODE.BadRequest_400;
+
+		for (const name of Object.keys(binary_hashes)) {
+			if (is_filtered_binary(name))
+				delete binary_hashes[name];
+		}
 
 		const submitted_names = Object.keys(binary_hashes);
 		if (submitted_names.length === 0)
