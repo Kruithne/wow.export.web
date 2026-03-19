@@ -1695,8 +1695,15 @@ export async function init(server: SpooderServer) {
 				const file_key = `${file.locale}/${file.file_name}`;
 				const checksum = checksums[file_key];
 
+				if (typeof checksum !== 'string') {
+					log(`cache file not uploaded {${file.object_id}}, cleaning up`);
+					await cache_bucket.delete(file.object_id);
+					await db_archavon`DELETE FROM cache_submission_files WHERE object_id = ${file.object_id}`;
+					continue;
+				}
+
 				try {
-					await cache_bucket.finalize(file.object_id, typeof checksum === 'string' ? checksum : undefined);
+					await cache_bucket.finalize(file.object_id, checksum);
 				} catch (e) {
 					log(`cache finalize failed for {${file.object_id}}: ${(e as Error).message}`);
 				}
