@@ -110,6 +110,7 @@ async function process_submission(submission_id: string) {
 			const res = await cache_bucket.download(file.object_id);
 
 			if (!res.ok) {
+				await res.body?.cancel();
 				log(`file {${file.object_id}}: download failed (${res.status}), rejecting`);
 				await reject_file(file, 'download_failed');
 				rejected++;

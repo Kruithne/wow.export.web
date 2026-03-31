@@ -136,6 +136,7 @@ export function bucket(bucket_id: string, bucket_secret: string) {
 
 		finalize: async function (object_id: string, checksum?: string): Promise<boolean> {
 			const res = await this.action('finalize', { object_id, checksum });
+			await res.body?.cancel();
 			return res.ok;
 		},
 
@@ -162,6 +163,7 @@ export function bucket(bucket_id: string, bucket_secret: string) {
 		 */
 		delete: async function (object_id: string): Promise<boolean> {
 			const res = await this.action('delete', { object_id });
+			await res.body?.cancel();
 			return res.ok;
 		},
 

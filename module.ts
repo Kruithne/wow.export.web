@@ -57,8 +57,10 @@ type KinoQueueEntry = {
 	srt?: Subtitle;
 };
 
+const KINO_FAILED_TTL = 24 * 60 * 60 * 1000;
+
 const kino_queue = new Map<Hash, KinoQueueEntry>();
-const kino_failed = new Set<Hash>();
+const kino_failed = new Map<Hash, number>();
 let kino_processing: Hash | null = null;
 
 function kino_is_valid_hash(str: string): boolean {
@@ -282,6 +284,7 @@ async function casc_download(path: string, offset?: number, length?: number): Pr
 				return res;
 			}
 
+			await res.body?.cancel();
 			failed_hosts.push(host);
 		} catch {
 			failed_hosts.push(host);
@@ -383,7 +386,7 @@ async function kino_process_video(entry: KinoQueueEntry, cache_key: string): Pro
 		await db`INSERT INTO kino_cached (enc) VALUES (${cache_key})`;
 	} catch (e) {
 		log(`kino: failed to process video ${e} ${JSON.stringify({ vid, aud, srt })}`);
-		kino_failed.add(cache_key);
+		kino_failed.set(cache_key, Date.now());
 	} finally {
 		await fs.rm(temp_dir, { recursive: true, force: true });
 	}
@@ -491,7 +494,16 @@ setInterval(() => {
 		else
 			cache_rate_ip.set(key, recent);
 	}
+
+	const kino_cutoff = now - KINO_FAILED_TTL;
+	for (const [key, ts] of kino_failed) {
+		if (ts < kino_cutoff)
+			kino_failed.delete(key);
+	}
 }, 60 * 60 * 1000);
+
+// prune stale submissions hourly
+setInterval(cache_cleanup_stale, 60 * 60 * 1000);
 
 interface CacheSubmitPayload {
 	machine_id: string;
