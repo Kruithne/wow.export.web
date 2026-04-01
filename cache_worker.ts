@@ -17,7 +17,14 @@ const WDB_STORE_MAP: Record<string, typeof store_creatures> = {
 const WDB_MAGIC_KEYS = new Set(Object.keys(WDB_STORE_MAP));
 const XFTH_MAGIC = 0x48544658;
 
-const queue: string[] = [];
+interface QueueNode {
+	value: string;
+	next: QueueNode | null;
+}
+
+let queue_head: QueueNode | null = null;
+let queue_tail: QueueNode | null = null;
+let queue_size = 0;
 let processing = false;
 
 async function reject_file(file: { object_id: string }, reason: string) {
@@ -42,7 +49,15 @@ function log(text: string) {
 
 self.onmessage = (event: MessageEvent) => {
 	const { submission_id } = event.data;
-	queue.push(submission_id);
+	const node: QueueNode = { value: submission_id, next: null };
+
+	if (queue_tail !== null)
+		queue_tail.next = node;
+	else
+		queue_head = node;
+
+	queue_tail = node;
+	queue_size++;
 
 	if (!processing)
 		process_queue();
@@ -51,9 +66,15 @@ self.onmessage = (event: MessageEvent) => {
 async function process_queue() {
 	processing = true;
 
-	while (queue.length > 0) {
-		const submission_id = queue.shift()!;
-		log(`processing {${submission_id}} (${queue.length} remaining)`);
+	while (queue_head !== null) {
+		const submission_id = queue_head.value;
+		queue_head = queue_head.next;
+		queue_size--;
+
+		if (queue_head === null)
+			queue_tail = null;
+
+		log(`processing {${submission_id}} (${queue_size} remaining)`);
 
 		try {
 			await process_submission(submission_id);
@@ -198,7 +219,7 @@ async function process_submission(submission_id: string) {
 								entry.region_id >>> 0,
 								entry.status,
 								build_number,
-								entry.record_data ? Buffer.from(entry.record_data) : null,
+								entry.record_data ? Buffer.from(new Uint8Array(entry.record_data)) : null,
 								product
 							);
 						}
