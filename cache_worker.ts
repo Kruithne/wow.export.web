@@ -224,6 +224,7 @@ async function process_submission(submission_id: string) {
 
 					const BATCH_SIZE = 500;
 					let inserted = 0;
+					const total_batches = Math.ceil(result.entries.length / BATCH_SIZE);
 
 					for (let i = 0; i < result.entries.length; i += BATCH_SIZE) {
 						const batch = result.entries.slice(i, i + BATCH_SIZE);
@@ -251,6 +252,10 @@ async function process_submission(submission_id: string) {
 						);
 
 						inserted += batch.length;
+
+						const batch_num = Math.floor(i / BATCH_SIZE) + 1;
+						if (batch_num % 50 === 0 || batch_num === total_batches)
+							measure_rss(`dbcache batch ${batch_num}/${total_batches}`);
 					}
 
 					measure_rss('after dbcache store');
