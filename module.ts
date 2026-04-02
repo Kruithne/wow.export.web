@@ -412,29 +412,59 @@ async function kino_process_queue(): Promise<void> {
 // region cache collection
 const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
 
-const cache_worker = new Worker('./wow.export/cache_worker.ts');
-
+const cache_queue: string[] = [];
+let cache_worker: Worker | null = null;
 let cache_worker_memory_resolve: ((data: NodeJS.MemoryUsage) => void) | null = null;
+
+function spawn_cache_worker(): Worker {
+	const worker = new Worker('./wow.export/cache_worker.ts');
+
+	worker.onmessage = (event: MessageEvent) => {
+		const { type, text, data } = event.data;
+
+		if (type === 'memory' && cache_worker_memory_resolve) {
+			cache_worker_memory_resolve(data);
+			cache_worker_memory_resolve = null;
+			return;
+		}
+
+		if (type === 'log') {
+			log(`cache ${text}`);
+			return;
+		}
+
+		if (type === 'done') {
+			worker.terminate();
+			cache_worker = null;
+			process_cache_queue();
+		}
+	};
+
+	return worker;
+}
+
+function process_cache_queue() {
+	if (cache_queue.length === 0 || cache_worker !== null)
+		return;
+
+	const submission_id = cache_queue.shift()!;
+	log(`processing {${submission_id}} (${cache_queue.length} remaining)`);
+
+	cache_worker = spawn_cache_worker();
+	cache_worker.postMessage({ submission_id });
+}
 
 function cache_worker_get_memory(): Promise<NodeJS.MemoryUsage> {
 	return new Promise(resolve => {
+		if (!cache_worker) {
+			resolve({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 });
+			return;
+		}
+
 		cache_worker_memory_resolve = resolve;
 		cache_worker.postMessage({ type: 'memory' });
 	});
 }
-
-cache_worker.onmessage = (event: MessageEvent) => {
-	const { type, text, data } = event.data;
-
-	if (type === 'memory' && cache_worker_memory_resolve) {
-		cache_worker_memory_resolve(data);
-		cache_worker_memory_resolve = null;
-		return;
-	}
-
-	if (type === 'log')
-		log(`cache ${text}`);
-};
 
 const FILTERED_BINARY_PATTERNS = [
 	/^blizzarderror\.exe$/i,
@@ -581,7 +611,9 @@ async function cache_recover_pending() {
 		`;
 
 		for (const row of pending)
-			cache_worker.postMessage({ submission_id: row.submission_id });
+			cache_queue.push(row.submission_id);
+
+		process_cache_queue();
 
 		if (pending.length > 0)
 			log(`cache recovered {${pending.length}} pending submissions`);
@@ -1745,7 +1777,8 @@ export async function init(server: SpooderServer) {
 				WHERE submission_id = ${submission_id}
 			`;
 
-			cache_worker.postMessage({ submission_id });
+			cache_queue.push(submission_id);
+			process_cache_queue();
 
 			return { success: true };
 		} catch (e) {

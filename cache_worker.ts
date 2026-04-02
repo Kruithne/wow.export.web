@@ -7,13 +7,6 @@ import { upsert_machine, store_creatures, store_quests, store_gameobjects, store
 
 const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
 
-function measure_rss(label: string): number {
-	Bun.gc(true);
-	const rss_mb = process.memoryUsage.rss() / 1024 / 1024;
-	log(`[mem] ${label}: ${rss_mb.toFixed(2)} MB`);
-	return rss_mb;
-}
-
 const WDB_STORE_MAP: Record<string, typeof store_creatures> = {
 	'WMOB': store_creatures,
 	'WQST': store_quests,
@@ -23,16 +16,6 @@ const WDB_STORE_MAP: Record<string, typeof store_creatures> = {
 
 const WDB_MAGIC_KEYS = new Set(Object.keys(WDB_STORE_MAP));
 const XFTH_MAGIC = 0x48544658;
-
-interface QueueNode {
-	value: string;
-	next: QueueNode | null;
-}
-
-let queue_head: QueueNode | null = null;
-let queue_tail: QueueNode | null = null;
-let queue_size = 0;
-let processing = false;
 
 async function reject_file(file: { object_id: string }, reason: string) {
 	try {
@@ -54,49 +37,21 @@ function log(text: string) {
 	self.postMessage({ type: 'log', text });
 }
 
-self.onmessage = (event: MessageEvent) => {
+self.onmessage = async (event: MessageEvent) => {
 	if (event.data.type === 'memory') {
 		self.postMessage({ type: 'memory', data: process.memoryUsage() });
 		return;
 	}
 
 	const { submission_id } = event.data;
-	const node: QueueNode = { value: submission_id, next: null };
-
-	if (queue_tail !== null)
-		queue_tail.next = node;
-	else
-		queue_head = node;
-
-	queue_tail = node;
-	queue_size++;
-
-	if (!processing)
-		process_queue();
-};
-
-async function process_queue() {
-	processing = true;
-
-	while (queue_head !== null) {
-		const submission_id = queue_head.value;
-		queue_head = queue_head.next;
-		queue_size--;
-
-		if (queue_head === null)
-			queue_tail = null;
-
-		log(`processing {${submission_id}} (${queue_size} remaining)`);
-
-		try {
-			await process_submission(submission_id);
-		} catch (e) {
-			caution('cache: failed to process submission', { submission_id, error: e });
-		}
+	try {
+		await process_submission(submission_id);
+	} catch (e) {
+		caution('cache: failed to process submission', { submission_id, error: e });
 	}
 
-	processing = false;
-}
+	self.postMessage({ type: 'done' });
+};
 
 async function update_file_status(object_id: string, status: string, failure_reason: string | null, records_added: number) {
 	await db_archavon`
@@ -138,13 +93,9 @@ async function process_submission(submission_id: string) {
 	let rejected = 0;
 	const rejection_reasons: string[] = [];
 
-	const rss_before = measure_rss('submission start');
-
 	for (const file of files) {
 		try {
 			const res = await cache_bucket.download(file.object_id);
-			measure_rss('after download');
-
 			if (!res.ok) {
 				await res.body?.cancel();
 				log(`file {${file.object_id}}: download failed (${res.status}), rejecting`);
@@ -155,8 +106,6 @@ async function process_submission(submission_id: string) {
 			}
 
 			const data = await res.arrayBuffer();
-			measure_rss('after arrayBuffer');
-
 			if (data.byteLength < 4) {
 				log(`file {${file.object_id}}: too small (${data.byteLength} bytes), rejecting`);
 				await reject_file(file, 'parse_error');
@@ -180,8 +129,6 @@ async function process_submission(submission_id: string) {
 				}
 
 				const result = parse_wdb(data, patch);
-				measure_rss('after parse_wdb');
-
 				if (result) {
 					const valid_records = result.records.filter(r => !('parse_error' in r.data));
 					const parse_errors = result.records.length - valid_records.length;
@@ -189,7 +136,6 @@ async function process_submission(submission_id: string) {
 					const store_fn = WDB_STORE_MAP[sig];
 					if (store_fn) {
 						const stored = await store_fn(db_archavon, valid_records, file.locale, product, build_number, machine_id, submission_id);
-						measure_rss('after wdb store');
 						log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, stored ${stored}, ${parse_errors} parse errors (${sig})`);
 						await update_file_status(file.object_id, 'completed', null, stored);
 						completed++;
@@ -217,14 +163,11 @@ async function process_submission(submission_id: string) {
 				}
 
 				const result = parse_dbcache(data);
-				measure_rss('after parse_dbcache');
-
 				if (result) {
 					log(`dbcache {${file.locale}/${file.file_name}}: ${result.entries.length} entries, build=${result.header.build}, version=${result.header.version}`);
 
 					const BATCH_SIZE = 500;
 					let inserted = 0;
-					const total_batches = Math.ceil(result.entries.length / BATCH_SIZE);
 
 					for (let i = 0; i < result.entries.length; i += BATCH_SIZE) {
 						const batch = result.entries.slice(i, i + BATCH_SIZE);
@@ -252,13 +195,8 @@ async function process_submission(submission_id: string) {
 						);
 
 						inserted += batch.length;
-
-						const batch_num = Math.floor(i / BATCH_SIZE) + 1;
-						if (batch_num % 50 === 0 || batch_num === total_batches)
-							measure_rss(`dbcache batch ${batch_num}/${total_batches}`);
 					}
 
-					measure_rss('after dbcache store');
 					log(`dbcache {${file.locale}/${file.file_name}}: stored {${inserted}} hotfix entries`);
 					await update_file_status(file.object_id, 'completed', null, inserted);
 					completed++;
@@ -276,9 +214,6 @@ async function process_submission(submission_id: string) {
 			rejection_reasons.push('download_failed');
 		}
 	}
-
-	const rss_after = measure_rss('submission end');
-	log(`[mem] delta: ${(rss_after - rss_before).toFixed(2)} MB`);
 
 	const total = completed + rejected;
 	let status: string;
