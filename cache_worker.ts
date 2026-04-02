@@ -48,6 +48,11 @@ function log(text: string) {
 }
 
 self.onmessage = (event: MessageEvent) => {
+	if (event.data.type === 'memory') {
+		self.postMessage({ type: 'memory', data: process.memoryUsage() });
+		return;
+	}
+
 	const { submission_id } = event.data;
 	const node: QueueNode = { value: submission_id, next: null };
 

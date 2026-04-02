@@ -413,8 +413,25 @@ async function kino_process_queue(): Promise<void> {
 const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
 
 const cache_worker = new Worker('./wow.export/cache_worker.ts');
+
+let cache_worker_memory_resolve: ((data: NodeJS.MemoryUsage) => void) | null = null;
+
+function cache_worker_get_memory(): Promise<NodeJS.MemoryUsage> {
+	return new Promise(resolve => {
+		cache_worker_memory_resolve = resolve;
+		cache_worker.postMessage({ type: 'memory' });
+	});
+}
+
 cache_worker.onmessage = (event: MessageEvent) => {
-	const { type, text } = event.data;
+	const { type, text, data } = event.data;
+
+	if (type === 'memory' && cache_worker_memory_resolve) {
+		cache_worker_memory_resolve(data);
+		cache_worker_memory_resolve = null;
+		return;
+	}
+
 	if (type === 'log')
 		log(`cache ${text}`);
 };
@@ -1143,6 +1160,8 @@ let trigger_update_queue: TriggerUpdateRequest[] = [];
 let is_processing_trigger_update = false;
 
 let release_builds: Record<string, string> = {}; // automatically populated
+
+export { cache_worker_get_memory };
 
 export async function init(server: SpooderServer) {
 	try {
