@@ -1111,6 +1111,21 @@ async function b_listfile_write_fat_files(target_dir: string, entries: ListfileE
 	log(`wrote {listfile-id-index-fat.dat} with {${sorted_entries.length}} entries`);
 }
 
+const LISTFILE_BINARY_FILES = [
+	'listfile-id-index.dat',
+	'listfile-strings.dat',
+	'listfile-tree-nodes.dat',
+	'listfile-tree-index.dat',
+	'listfile-pf-models.dat',
+	'listfile-pf-textures.dat',
+	'listfile-pf-sounds.dat',
+	'listfile-pf-videos.dat',
+	'listfile-pf-text.dat',
+	'listfile-pf-fonts.dat',
+	'listfile-strings-fat.dat',
+	'listfile-id-index-fat.dat',
+];
+
 async function update_listfile() {
 	const target_dir = './wow.export/data/listfile';
 	const version_file = path.join(target_dir, 'version.json');
@@ -1160,13 +1175,37 @@ async function update_listfile() {
 	const url = 'https://github.com/wowdev/wow-listfile/releases/latest/download/community-listfile.csv';
 	await download_and_store(url, target_dir, 'master', 'listfile');
 
+	// build binary files in a staging directory, then atomically swap into place
+	// to prevent clients from downloading a mix of old/new files during rebuild
+	const staging_dir = path.join(os.tmpdir(), `listfile_staging_${crypto.randomUUID()}`);
+
 	try {
-		await b_listfile_build(target_dir);
+		await fs.mkdir(staging_dir, { recursive: true });
+		await fs.copyFile(path.join(target_dir, 'master'), path.join(staging_dir, 'master'));
+
+		await b_listfile_build(staging_dir);
+
+		// atomically swap each binary file from staging into the live directory
+		await fs.mkdir(target_dir, { recursive: true });
+		for (const file of LISTFILE_BINARY_FILES) {
+			const src = path.join(staging_dir, file);
+			const dst = path.join(target_dir, file);
+
+			try {
+				await fs.stat(src);
+			} catch {
+				continue;
+			}
+
+			await fs.rename(src, dst);
+		}
 
 		await Bun.write(version_file, JSON.stringify(remote_head, null, 2));
 		log(`saved listfile version to {${version_file}}`);
 	} catch (error) {
 		caution('Failed to build binary listfiles', [error instanceof Error ? error.message : String(error)]);
+	} finally {
+		await fs.rm(staging_dir, { recursive: true, force: true }).catch(() => {});
 	}
 }
 
