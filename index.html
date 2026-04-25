@@ -56,9 +56,17 @@
 						</t-if>
 					</div>
 				</t-if>
+				<t-if test="osx-arm64">
+					<div class="download-group">
+						<a href="https://www.kruithne.net/wow.export/download/osx-arm64/{{ osx-arm64 }}" id="intro-button-osx">Download for macOS (Apple Silicon)</a>
+						<t-if test="portable-osx-arm64">
+							<a href="{{ portable-osx-arm64 }}" class="portable-link" target="_blank">Portable Download</a>
+						</t-if>
+					</div>
+				</t-if>
 				<t-if test="osx-x64">
 					<div class="download-group">
-						<a href="https://www.kruithne.net/wow.export/download/osx-x64/{{ osx-x64 }}" id="intro-button-osx">Download for macOS</a>
+						<a href="https://www.kruithne.net/wow.export/download/osx-x64/{{ osx-x64 }}" id="intro-button-osx">Download for macOS (Intel)</a>
 						<t-if test="portable-osx-x64">
 							<a href="{{ portable-osx-x64 }}" class="portable-link" target="_blank">Portable Download</a>
 						</t-if>
