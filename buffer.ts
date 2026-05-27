@@ -132,6 +132,12 @@ export default class BufferReader {
 		return value;
 	}
 
+	readInt8(): number {
+		const value = this.view.getInt8(this._offset);
+		this._offset += 1;
+		return value;
+	}
+
 	readUInt64LE(): bigint {
 		const lo = this.view.getUint32(this._offset, true);
 		const hi = this.view.getUint32(this._offset + 4, true);

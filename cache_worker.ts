@@ -128,7 +128,7 @@ async function process_submission(submission_id: string) {
 					continue;
 				}
 
-				const result = parse_wdb(data, patch);
+				const result = parse_wdb(data, patch, product);
 				if (result) {
 					const valid_records = result.records.filter(r => !('parse_error' in r.data));
 					const parse_errors = result.records.length - valid_records.length;
