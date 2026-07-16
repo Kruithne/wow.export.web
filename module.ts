@@ -412,12 +412,59 @@ async function kino_process_queue(): Promise<void> {
 // region cache collection
 const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
 
+const CACHE_MAX_RETRIES = 2;
+
 const cache_queue: string[] = [];
+const cache_retry_counts = new Map<string, number>();
 let cache_worker: Worker | null = null;
+let cache_worker_submission: string | null = null;
 let cache_worker_memory_resolve: ((data: NodeJS.MemoryUsage) => void) | null = null;
+
+async function cache_fail_submission(submission_id: string, reason: string) {
+	try {
+		await db_archavon`
+			UPDATE cache_submissions
+			SET status = 'failed', processed_at = NOW(), status_reason = ${reason}
+			WHERE submission_id = ${submission_id}
+		`;
+	} catch (e) {
+		caution('cache: failed to mark crashed submission', { submission_id, error: e });
+	}
+}
 
 function spawn_cache_worker(): Worker {
 	const worker = new Worker('./wow.export/cache_worker.ts');
+	let done_received = false;
+	let handled = false;
+
+	// resets worker state and re-drives the queue on any worker exit, so a
+	// crash (OOM/hard death) that never posts 'done' can't wedge the pipeline
+	async function handle_exit() {
+		if (handled)
+			return;
+
+		handled = true;
+		const submission_id = cache_worker_submission;
+		cache_worker = null;
+		cache_worker_submission = null;
+
+		if (!done_received && submission_id !== null) {
+			const attempts = (cache_retry_counts.get(submission_id) ?? 0) + 1;
+			if (attempts <= CACHE_MAX_RETRIES) {
+				cache_retry_counts.set(submission_id, attempts);
+				cache_queue.push(submission_id);
+				log(`cache worker died on {${submission_id}}, requeued (attempt ${attempts}/${CACHE_MAX_RETRIES})`);
+			} else {
+				cache_retry_counts.delete(submission_id);
+				log(`cache worker died on {${submission_id}}, giving up after ${CACHE_MAX_RETRIES} attempts`);
+				await cache_fail_submission(submission_id, `worker crashed ${CACHE_MAX_RETRIES} times`);
+			}
+		} else if (submission_id !== null) {
+			cache_retry_counts.delete(submission_id);
+		}
+
+		process_cache_queue();
+	}
 
 	worker.onmessage = (event: MessageEvent) => {
 		const { type, text, data } = event.data;
@@ -434,11 +481,19 @@ function spawn_cache_worker(): Worker {
 		}
 
 		if (type === 'done') {
+			done_received = true;
 			worker.terminate();
-			cache_worker = null;
-			process_cache_queue();
+			handle_exit();
 		}
 	};
+
+	worker.onerror = (event: ErrorEvent) => {
+		caution('cache: worker error', { submission_id: cache_worker_submission, error: event.message ?? event });
+		worker.terminate();
+		handle_exit();
+	};
+
+	worker.addEventListener('close', () => handle_exit());
 
 	return worker;
 }
@@ -450,6 +505,7 @@ function process_cache_queue() {
 	const submission_id = cache_queue.shift()!;
 	log(`processing {${submission_id}} (${cache_queue.length} remaining)`);
 
+	cache_worker_submission = submission_id;
 	cache_worker = spawn_cache_worker();
 	cache_worker.postMessage({ submission_id });
 }
