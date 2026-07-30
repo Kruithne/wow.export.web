@@ -1282,11 +1282,124 @@ interface TriggerUpdateRequest {
 }
 
 const RELEASE_BUILD_FILE = './wow.export/data/release_builds.json';
+const RELEASE_BUILD_V2_FILE = './wow.export/data/release_builds_v2.json';
+
+const V3_PLATFORMS = ['win-x64', 'linux-x64', 'osx-x64', 'osx-arm64'];
+const V3_VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
+const V3_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+const V3_RELEASE_DIR = './wow.export/release';
+const V3_DOWNLOAD_DIR = './wow.export/download';
+const V3_RETAIN_VERSIONS = 3;
+const V3_MAX_META_SIZE = 64 * 1024;
+
+interface V3MetaFile {
+	name: string;
+	kind: 'file' | 'bundle';
+	size: number;
+	sha256: string;
+	comp_size: number;
+	comp: string;
+	url: string;
+}
+
+interface V3Meta {
+	platform: string;
+	version: string;
+	files: V3MetaFile[];
+}
+
+interface V3TriggerPayload {
+	name: string;
+	url: string;
+}
+
+function v3_public_key(): ReturnType<typeof crypto.createPublicKey> | null {
+	const hex = process.env.WOW_EXPORT_V3_PUBLIC_KEY;
+	if (!hex || !/^[0-9a-f]{64}$/.test(hex))
+		return null;
+
+	const der = Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(hex, 'hex')]);
+	return crypto.createPublicKey({ key: der, format: 'der', type: 'spki' });
+}
+
+function v3_parse_meta(text: string): V3Meta {
+	let format: string | null = null;
+	let platform: string | null = null;
+	let version: string | null = null;
+	const files: V3MetaFile[] = [];
+
+	for (const raw_line of text.split('\n')) {
+		const line = raw_line.replace(/\r$/, '');
+		if (line.length === 0 || line.startsWith('#'))
+			continue;
+
+		const eq = line.indexOf('=');
+		if (eq === -1)
+			continue;
+
+		const key = line.substring(0, eq);
+		const value = line.substring(eq + 1);
+
+		if (key === 'format') {
+			format = value;
+		} else if (key === 'platform') {
+			platform = value;
+		} else if (key === 'version') {
+			version = value;
+		} else if (key === 'file') {
+			const fields = value.split('|');
+			if (fields.length !== 7)
+				throw new Error(`meta file entry has ${fields.length} fields, expected 7`);
+
+			const [name, kind, size, sha256, comp_size, comp, url] = fields as [string, string, string, string, string, string, string];
+
+			if (!V3_NAME_PATTERN.test(name) || name === '.' || name === '..')
+				throw new Error(`meta file name not permitted: ${name}`);
+
+			if (kind !== 'file' && kind !== 'bundle')
+				throw new Error(`unknown meta file kind: ${kind}`);
+
+			if (!/^[a-f0-9]{64}$/.test(sha256))
+				throw new Error(`invalid sha256 for ${name}`);
+
+			const size_n = Number(size);
+			const comp_size_n = Number(comp_size);
+			if (!Number.isInteger(size_n) || size_n <= 0 || !Number.isInteger(comp_size_n) || comp_size_n <= 0)
+				throw new Error(`invalid sizes for ${name}`);
+
+			files.push({ name, kind, size: size_n, sha256, comp_size: comp_size_n, comp, url });
+		}
+	}
+
+	if (format !== '1')
+		throw new Error(`unsupported meta format: ${format}`);
+
+	if (platform === null || version === null)
+		throw new Error('meta missing platform or version');
+
+	if (files.length === 0)
+		throw new Error('meta contains no file entries');
+
+	return { platform, version, files };
+}
+
+function v3_compare_versions(a: string, b: string): number {
+	const pa = a.split('.').map(Number);
+	const pb = b.split('.').map(Number);
+
+	for (let i = 0; i < 3; i++) {
+		if (pa[i]! !== pb[i]!)
+			return pa[i]! - pb[i]!;
+	}
+
+	return 0;
+}
 
 let trigger_update_queue: TriggerUpdateRequest[] = [];
 let is_processing_trigger_update = false;
 
 let release_builds: Record<string, string> = {}; // automatically populated
+let release_builds_v2: Record<string, { version: string; archive: string; setup?: string }> = {};
 
 export { cache_worker_get_memory };
 
@@ -1295,6 +1408,12 @@ export async function init(server: SpooderServer) {
 		release_builds = await Bun.file(RELEASE_BUILD_FILE).json();
 	} catch (e) {
 		log(`failed to load RELEASE_BUILD_FILE ${RELEASE_BUILD_FILE}: ${(e as Error).message}`);
+	}
+
+	try {
+		release_builds_v2 = await Bun.file(RELEASE_BUILD_V2_FILE).json();
+	} catch (e) {
+		log(`failed to load RELEASE_BUILD_V2_FILE ${RELEASE_BUILD_V2_FILE}: ${(e as Error).message}`);
 	}
 
 	casc_ready = casc_init();
@@ -1340,6 +1459,7 @@ export async function init(server: SpooderServer) {
 	server.dir('/wow.export/static', './wow.export/static');
 	server.dir('/wow.export/update', './wow.export/update');
 	server.dir('/wow.export/download', './wow.export/download');
+	server.dir('/wow.export/release', V3_RELEASE_DIR);
 
 	async function stream_to_file(url: string, file_path: string, name: string): Promise<void> {
 		const response = await fetch(url);
@@ -1479,6 +1599,140 @@ export async function init(server: SpooderServer) {
 		}
 	}
 
+	async function v3_fetch_buffer(url: string, max_size: number, name: string): Promise<Buffer> {
+		const response = await fetch(url);
+		if (!response.ok)
+			throw new Error(`failed to fetch ${name}: ${response.status} ${response.statusText}`);
+
+		const buffer = Buffer.from(await response.arrayBuffer());
+		if (buffer.length === 0 || buffer.length > max_size)
+			throw new Error(`${name} size ${buffer.length} out of bounds (max ${max_size})`);
+
+		return buffer;
+	}
+
+	async function process_trigger_release(platform: string, json: any) {
+		const platform_dir = path.join(V3_RELEASE_DIR, platform);
+		const version_dir = path.join(platform_dir, json.version);
+
+		try {
+			log(`accepting v3 release {${json.version}} for {${platform}}`);
+
+			const public_key = v3_public_key();
+			if (public_key === null)
+				throw new Error('WOW_EXPORT_V3_PUBLIC_KEY is missing or invalid');
+
+			const meta_bytes = await v3_fetch_buffer(json.meta_url, V3_MAX_META_SIZE, 'meta');
+			const sig_bytes = await v3_fetch_buffer(json.sig_url, 512, 'signature');
+
+			if (sig_bytes.length !== 64 || !crypto.verify(null, meta_bytes, public_key, sig_bytes))
+				throw new Error('meta signature verification failed');
+
+			const meta = v3_parse_meta(meta_bytes.toString('utf8'));
+
+			if (meta.platform !== platform)
+				throw new Error(`meta platform ${meta.platform} does not match request ${platform}`);
+
+			if (meta.version !== json.version)
+				throw new Error(`meta version ${meta.version} does not match request ${json.version}`);
+
+			const payloads = json.payloads as V3TriggerPayload[];
+
+			await fs.mkdir(version_dir, { recursive: true });
+
+			for (const entry of meta.files) {
+				const payload = payloads.find(p => p.name === entry.name);
+				if (payload === undefined)
+					throw new Error(`no payload url provided for ${entry.name}`);
+
+				const stored_name = entry.kind === 'bundle' ? `${entry.name}.tar.gz` : `${entry.name}.gz`;
+				const stored_path = path.join(version_dir, stored_name);
+				const tmp_path = stored_path + '.tmp';
+
+				log(`downloading v3 payload {${entry.name}} from {${payload.url}}`);
+				await stream_to_file(payload.url, tmp_path, entry.name);
+
+				const compressed = Buffer.from(await Bun.file(tmp_path).arrayBuffer());
+				if (compressed.length !== entry.comp_size)
+					throw new Error(`${entry.name}: comp_size ${compressed.length} does not match meta ${entry.comp_size}`);
+
+				const decompressed = Bun.gunzipSync(compressed);
+				if (decompressed.length !== entry.size)
+					throw new Error(`${entry.name}: size ${decompressed.length} does not match meta ${entry.size}`);
+
+				const hash = crypto.createHash('sha256').update(decompressed).digest('hex');
+				if (hash !== entry.sha256)
+					throw new Error(`${entry.name}: sha256 mismatch`);
+
+				await fs.rename(tmp_path, stored_path);
+			}
+
+			// meta moves into place only after every payload is fully written;
+			// sig first so a mismatched pairing fails verification client-side
+			const meta_tmp = path.join(platform_dir, 'latest.meta.tmp');
+			const sig_tmp = path.join(platform_dir, 'latest.meta.sig.tmp');
+			await Bun.write(meta_tmp, meta_bytes);
+			await Bun.write(sig_tmp, sig_bytes);
+			await fs.rename(sig_tmp, path.join(platform_dir, 'latest.meta.sig'));
+			await fs.rename(meta_tmp, path.join(platform_dir, 'latest.meta'));
+
+			const download_dir = path.join(V3_DOWNLOAD_DIR, platform);
+			await fs.mkdir(download_dir, { recursive: true });
+
+			const archive_name = path.basename(new URL(json.archive_url).pathname);
+			const archive_tmp = path.join(download_dir, archive_name + '.tmp');
+			log(`downloading v3 archive from {${json.archive_url}}`);
+			await stream_to_file(json.archive_url, archive_tmp, 'archive');
+			await fs.rename(archive_tmp, path.join(download_dir, archive_name));
+
+			let setup_name: string | undefined;
+			if (platform === 'win-x64' && typeof json.setup_url === 'string') {
+				setup_name = path.basename(new URL(json.setup_url).pathname);
+				const setup_tmp = path.join(download_dir, setup_name + '.tmp');
+				log(`downloading v3 setup from {${json.setup_url}}`);
+				await stream_to_file(json.setup_url, setup_tmp, 'setup');
+				await fs.rename(setup_tmp, path.join(download_dir, setup_name));
+			}
+
+			release_builds_v2[platform] = {
+				version: meta.version,
+				archive: archive_name,
+				...(setup_name !== undefined && { setup: setup_name })
+			};
+
+			index = null; // force index re-render
+			await Bun.write(RELEASE_BUILD_V2_FILE, JSON.stringify(release_builds_v2));
+
+			const entries = await fs.readdir(platform_dir, { withFileTypes: true });
+			const versions = entries
+				.filter(e => e.isDirectory() && V3_VERSION_PATTERN.test(e.name))
+				.map(e => e.name)
+				.sort((a, b) => v3_compare_versions(b, a));
+
+			const keep = new Set(versions.slice(0, V3_RETAIN_VERSIONS));
+			keep.add(meta.version);
+
+			for (const version of versions) {
+				if (!keep.has(version)) {
+					log(`pruning v3 release {${platform}/${version}}`);
+					await fs.rm(path.join(platform_dir, version), { recursive: true, force: true });
+				}
+			}
+
+			log(`successfully published v3 release {${meta.version}} for {${platform}}`);
+		} catch (e) {
+			try {
+				const leftovers = await fs.readdir(version_dir);
+				for (const name of leftovers) {
+					if (name.endsWith('.tmp'))
+						await fs.unlink(path.join(version_dir, name));
+				}
+			} catch {}
+
+			caution('wow.export v3 release failed', { e, platform, json });
+		}
+	}
+
 	async function process_trigger_update_queue() {
 		if (is_processing_trigger_update || trigger_update_queue.length === 0)
 			return;
@@ -1605,6 +1859,45 @@ export async function init(server: SpooderServer) {
 			trigger_update(build_tag, json, process_trigger_update);
 		else
 			return HTTP_STATUS_CODE.BadRequest_400;
+
+		return HTTP_STATUS_CODE.Accepted_202;
+	});
+
+	server.json('/wow.export/v3/trigger_release/:platform', async (req, url, json) => {
+		const key = req.headers.get('authorization');
+		const expected_key = process.env.WOW_EXPORT_V3_UPDATE_KEY;
+
+		if (!expected_key || key !== expected_key)
+			return HTTP_STATUS_CODE.Unauthorized_401;
+
+		const platform = url.searchParams.get('platform');
+		if (platform === null || !V3_PLATFORMS.includes(platform))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		if (typeof json.version !== 'string' || !V3_VERSION_PATTERN.test(json.version))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		if (typeof json.meta_url !== 'string' || typeof json.sig_url !== 'string' || typeof json.archive_url !== 'string')
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		if (!Array.isArray(json.payloads) || json.payloads.length === 0)
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		for (const payload of json.payloads) {
+			if (typeof payload !== 'object' || payload === null)
+				return HTTP_STATUS_CODE.BadRequest_400;
+
+			if (typeof payload.name !== 'string' || !V3_NAME_PATTERN.test(payload.name) || payload.name === '.' || payload.name === '..')
+				return HTTP_STATUS_CODE.BadRequest_400;
+
+			if (typeof payload.url !== 'string')
+				return HTTP_STATUS_CODE.BadRequest_400;
+		}
+
+		if (json.setup_url !== undefined && (platform !== 'win-x64' || typeof json.setup_url !== 'string'))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		trigger_update(platform, json, process_trigger_release);
 
 		return HTTP_STATUS_CODE.Accepted_202;
 	});
