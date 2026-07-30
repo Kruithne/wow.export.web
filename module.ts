@@ -1167,6 +1167,127 @@ async function b_listfile_write_fat_files(target_dir: string, entries: ListfileE
 	log(`wrote {listfile-id-index-fat.dat} with {${sorted_entries.length}} entries`);
 }
 
+const V3_LISTFILE_DIR = './wow.export/data/listfile/v3';
+const V3_LISTFILE_RETAIN = 10;
+const V3_LISTFILE_SHA_PATTERN = /^[a-f0-9]{40}$/;
+
+function v3_listfile_normalize(csv_content: string): Map<number, string> {
+	const entries = new Map<number, string>();
+
+	const lines = csv_content.split(/\r?\n/);
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (trimmed.length === 0)
+			continue;
+
+		const tokens = trimmed.split(';');
+		if (tokens.length !== 2)
+			continue;
+
+		const file_data_id = Number(tokens[0]);
+		if (!Number.isInteger(file_data_id) || file_data_id < 0)
+			continue;
+
+		const filename = tokens[1]!.trim().toLowerCase().replace(/\\/g, '/');
+		if (filename.length === 0 || filename.length > 0xffff)
+			continue;
+
+		entries.set(file_data_id, filename);
+	}
+
+	return entries;
+}
+
+function v3_listfile_serialize(entries: Map<number, string>): string {
+	const ids = Array.from(entries.keys()).sort((a, b) => a - b);
+	const lines: string[] = [];
+
+	for (const id of ids)
+		lines.push(`${id};${entries.get(id)}`);
+
+	return lines.join('\n') + '\n';
+}
+
+async function v3_listfile_write(file_path: string, data: Uint8Array | string): Promise<void> {
+	const tmp_path = file_path + '.tmp';
+	await Bun.write(tmp_path, data);
+	await fs.rename(tmp_path, file_path);
+}
+
+async function v3_listfile_build(sha: string, csv_content: string): Promise<void> {
+	await fs.mkdir(V3_LISTFILE_DIR, { recursive: true });
+
+	const entries = v3_listfile_normalize(csv_content);
+	if (entries.size === 0)
+		throw new Error('v3 listfile normalization produced no entries');
+
+	const raw = Buffer.from(v3_listfile_serialize(entries), 'utf8');
+	const full_bytes = Bun.gzipSync(raw);
+
+	await v3_listfile_write(path.join(V3_LISTFILE_DIR, `full-${sha}.csv.gz`), full_bytes);
+
+	let history: string[] = [];
+	try {
+		const manifest = await Bun.file(path.join(V3_LISTFILE_DIR, 'manifest.json')).json();
+		if (Array.isArray(manifest))
+			history = manifest.filter(e => typeof e === 'string' && V3_LISTFILE_SHA_PATTERN.test(e) && e !== sha);
+	} catch {}
+
+	for (const old_sha of history) {
+		const old_file = Bun.file(path.join(V3_LISTFILE_DIR, `full-${old_sha}.csv.gz`));
+		if (!await old_file.exists())
+			continue;
+
+		try {
+			const old_text = Bun.gunzipSync(Buffer.from(await old_file.arrayBuffer())).toString('utf8');
+			const old_entries = v3_listfile_normalize(old_text);
+			const delta_lines: string[] = [];
+
+			for (const id of old_entries.keys()) {
+				if (!entries.has(id))
+					delta_lines.push(`-${id}`);
+			}
+
+			for (const [id, filename] of entries) {
+				if (old_entries.get(id) !== filename)
+					delta_lines.push(`${id};${filename}`);
+			}
+
+			const delta_text = delta_lines.length > 0 ? delta_lines.join('\n') + '\n' : '';
+			const delta_bytes = Bun.gzipSync(Buffer.from(delta_text, 'utf8'));
+
+			await v3_listfile_write(path.join(V3_LISTFILE_DIR, `delta-${old_sha}-${sha}.csv.gz`), delta_bytes);
+			log(`v3 listfile delta {${old_sha.substring(0, 8)}} -> {${sha.substring(0, 8)}}: {${delta_lines.length}} operations`);
+		} catch (e) {
+			caution('v3 listfile delta failed', { old_sha, sha, error: e instanceof Error ? e.message : String(e) });
+		}
+	}
+
+	history.unshift(sha);
+	history = history.slice(0, V3_LISTFILE_RETAIN);
+	await v3_listfile_write(path.join(V3_LISTFILE_DIR, 'manifest.json'), JSON.stringify(history));
+
+	const version = { sha, entries: entries.size, size: raw.length, compressed: full_bytes.length };
+	await v3_listfile_write(path.join(V3_LISTFILE_DIR, 'version.json'), JSON.stringify(version));
+
+	const keep = new Set(history);
+	const files = await fs.readdir(V3_LISTFILE_DIR);
+
+	for (const file of files) {
+		const full_match = file.match(/^full-([a-f0-9]{40})\.csv\.gz$/);
+		if (full_match && !keep.has(full_match[1]!)) {
+			await fs.unlink(path.join(V3_LISTFILE_DIR, file)).catch(() => {});
+			continue;
+		}
+
+		const delta_match = file.match(/^delta-[a-f0-9]{40}-([a-f0-9]{40})\.csv\.gz$/);
+		if (delta_match && delta_match[1] !== sha)
+			await fs.unlink(path.join(V3_LISTFILE_DIR, file)).catch(() => {});
+	}
+
+	log(`v3 listfile published {${sha.substring(0, 8)}} ({${entries.size}} entries)`);
+}
+
 const LISTFILE_BINARY_FILES = [
 	'listfile-id-index.dat',
 	'listfile-strings.dat',
@@ -1209,7 +1330,25 @@ async function update_listfile() {
 			const local_sha = local_version?.object?.sha;
 
 			if (local_sha === remote_sha) {
-				log(`listfile is up to date ({${remote_sha.substring(0, 8)}})`);
+				let v3_current = false;
+				try {
+					const v3_version = await Bun.file(path.join(V3_LISTFILE_DIR, 'version.json')).json();
+					v3_current = v3_version?.sha === remote_sha;
+				} catch {}
+
+				if (v3_current) {
+					log(`listfile is up to date ({${remote_sha.substring(0, 8)}})`);
+					return;
+				}
+
+				log(`building v3 listfile from existing master ({${remote_sha.substring(0, 8)}})`);
+
+				try {
+					await v3_listfile_build(remote_sha, await Bun.file(path.join(target_dir, 'master')).text());
+				} catch (e) {
+					caution('Failed to build v3 listfile', [e instanceof Error ? e.message : String(e)]);
+				}
+
 				return;
 			}
 
@@ -1255,6 +1394,8 @@ async function update_listfile() {
 
 			await fs.rename(src, dst);
 		}
+
+		await v3_listfile_build(remote_head.object.sha, await Bun.file(path.join(target_dir, 'master')).text());
 
 		await Bun.write(version_file, JSON.stringify(remote_head, null, 2));
 		log(`saved listfile version to {${version_file}}`);
@@ -1452,6 +1593,55 @@ export async function init(server: SpooderServer) {
 		const dbd = await fetch(`https://raw.githubusercontent.com/wowdev/WoWDBDefs/master/definitions/${def}.dbd`);
 		return new Response(dbd.body, {
 			status: dbd.status
+		});
+	});
+
+	server.route('/wow.export/v3/listfile/version', async () => {
+		const file = Bun.file(path.join(V3_LISTFILE_DIR, 'version.json'));
+		if (!await file.exists())
+			return HTTP_STATUS_CODE.NotFound_404;
+
+		return new Response(file, {
+			headers: {
+				'Content-Type': 'application/json',
+				'Cache-Control': 'no-cache'
+			}
+		});
+	});
+
+	server.route('/wow.export/v3/listfile/full/:sha', async (req, url) => {
+		const sha = url.searchParams.get('sha');
+		if (sha === null || !V3_LISTFILE_SHA_PATTERN.test(sha))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		const file = Bun.file(path.join(V3_LISTFILE_DIR, `full-${sha}.csv.gz`));
+		if (!await file.exists())
+			return HTTP_STATUS_CODE.NotFound_404;
+
+		return new Response(file, {
+			headers: {
+				'Content-Type': 'application/gzip',
+				'Cache-Control': 'public, max-age=31536000, immutable'
+			}
+		});
+	});
+
+	server.route('/wow.export/v3/listfile/delta/:from/:to', async (req, url) => {
+		const from = url.searchParams.get('from');
+		const to = url.searchParams.get('to');
+
+		if (from === null || to === null || !V3_LISTFILE_SHA_PATTERN.test(from) || !V3_LISTFILE_SHA_PATTERN.test(to))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		const file = Bun.file(path.join(V3_LISTFILE_DIR, `delta-${from}-${to}.csv.gz`));
+		if (!await file.exists())
+			return HTTP_STATUS_CODE.NotFound_404;
+
+		return new Response(file, {
+			headers: {
+				'Content-Type': 'application/gzip',
+				'Cache-Control': 'public, max-age=31536000, immutable'
+			}
 		});
 	});
 
