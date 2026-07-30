@@ -1210,7 +1210,7 @@ function v3_listfile_serialize(entries: Map<number, string>): string {
 	return lines.join('\n') + '\n';
 }
 
-async function v3_listfile_write(file_path: string, data: Uint8Array | string): Promise<void> {
+async function v3_atomic_write(file_path: string, data: Uint8Array | string): Promise<void> {
 	const tmp_path = file_path + '.tmp';
 	await Bun.write(tmp_path, data);
 	await fs.rename(tmp_path, file_path);
@@ -1226,7 +1226,7 @@ async function v3_listfile_build(sha: string, csv_content: string): Promise<void
 	const raw = Buffer.from(v3_listfile_serialize(entries), 'utf8');
 	const full_bytes = Bun.gzipSync(raw);
 
-	await v3_listfile_write(path.join(V3_LISTFILE_DIR, `full-${sha}.csv.gz`), full_bytes);
+	await v3_atomic_write(path.join(V3_LISTFILE_DIR, `full-${sha}.csv.gz`), full_bytes);
 
 	let history: string[] = [];
 	try {
@@ -1260,7 +1260,7 @@ async function v3_listfile_build(sha: string, csv_content: string): Promise<void
 			const delta_text = delta_lines.length > 0 ? delta_lines.join('\n') + '\n' : '';
 			const delta_bytes = Bun.gzipSync(Buffer.from(delta_text, 'utf8'));
 
-			await v3_listfile_write(path.join(V3_LISTFILE_DIR, `delta-${old_sha}-${sha}.csv.gz`), delta_bytes);
+			await v3_atomic_write(path.join(V3_LISTFILE_DIR, `delta-${old_sha}-${sha}.csv.gz`), delta_bytes);
 			log(`v3 listfile delta {${old_sha.substring(0, 8)}} -> {${sha.substring(0, 8)}}: {${delta_lines.length}} operations`);
 		} catch (e) {
 			caution('v3 listfile delta failed', { old_sha, sha, error: e instanceof Error ? e.message : String(e) });
@@ -1269,10 +1269,10 @@ async function v3_listfile_build(sha: string, csv_content: string): Promise<void
 
 	history.unshift(sha);
 	history = history.slice(0, V3_LISTFILE_RETAIN);
-	await v3_listfile_write(path.join(V3_LISTFILE_DIR, 'manifest.json'), JSON.stringify(history));
+	await v3_atomic_write(path.join(V3_LISTFILE_DIR, 'manifest.json'), JSON.stringify(history));
 
 	const version = { sha, entries: entries.size, size: raw.length, compressed: full_bytes.length };
-	await v3_listfile_write(path.join(V3_LISTFILE_DIR, 'version.json'), JSON.stringify(version));
+	await v3_atomic_write(path.join(V3_LISTFILE_DIR, 'version.json'), JSON.stringify(version));
 
 	const keep = new Set(history);
 	const files = await fs.readdir(V3_LISTFILE_DIR);
@@ -1410,11 +1410,180 @@ async function update_listfile() {
 	}
 }
 
+const V3_TACT_DIR = './wow.export/data/tact/v3';
+const V3_TACT_RETAIN = 10;
+const V3_TACT_MAX_SIZE = 64 * 1024 * 1024;
+const V3_TACT_SHA_PATTERN = /^[a-f0-9]{40}$/;
+const V3_TACT_NAME_PATTERN = /^[a-f0-9]{16}$/;
+const V3_TACT_KEY_PATTERN = /^[a-f0-9]{32}$/;
+
+function v3_tact_normalize(text: string): Map<string, string> {
+	const entries = new Map<string, string>();
+
+	const lines = text.split(/\r?\n/);
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (trimmed.length === 0)
+			continue;
+
+		const tokens = trimmed.split(/\s+/);
+		if (tokens.length < 2)
+			continue;
+
+		const key_name = tokens[0]!.toLowerCase();
+		const key = tokens[1]!.toLowerCase();
+
+		if (!V3_TACT_NAME_PATTERN.test(key_name) || !V3_TACT_KEY_PATTERN.test(key))
+			continue;
+
+		entries.set(key_name, key);
+	}
+
+	return entries;
+}
+
+function v3_tact_serialize(entries: Map<string, string>): string {
+	const names = Array.from(entries.keys()).sort();
+	const lines: string[] = [];
+
+	for (const name of names)
+		lines.push(`${name} ${entries.get(name)}`);
+
+	return lines.join('\n') + '\n';
+}
+
+async function v3_tact_build(sha: string, entries: Map<string, string>): Promise<void> {
+	await fs.mkdir(V3_TACT_DIR, { recursive: true });
+
+	const raw = Buffer.from(v3_tact_serialize(entries), 'utf8');
+	const full_bytes = Bun.gzipSync(raw);
+
+	await v3_atomic_write(path.join(V3_TACT_DIR, `full-${sha}.txt.gz`), full_bytes);
+
+	let history: string[] = [];
+	try {
+		const manifest = await Bun.file(path.join(V3_TACT_DIR, 'manifest.json')).json();
+		if (Array.isArray(manifest))
+			history = manifest.filter(e => typeof e === 'string' && V3_TACT_SHA_PATTERN.test(e) && e !== sha);
+	} catch {}
+
+	for (const old_sha of history) {
+		const old_file = Bun.file(path.join(V3_TACT_DIR, `full-${old_sha}.txt.gz`));
+		if (!await old_file.exists())
+			continue;
+
+		try {
+			const old_compressed = Buffer.from(await old_file.arrayBuffer());
+			const old_text = zlib.gunzipSync(old_compressed, { maxOutputLength: V3_TACT_MAX_SIZE }).toString('utf8');
+			const old_entries = v3_tact_normalize(old_text);
+			const delta_lines: string[] = [];
+
+			for (const key_name of old_entries.keys()) {
+				if (!entries.has(key_name))
+					delta_lines.push(`-${key_name}`);
+			}
+
+			for (const [key_name, key] of entries) {
+				if (old_entries.get(key_name) !== key)
+					delta_lines.push(`${key_name} ${key}`);
+			}
+
+			const delta_text = delta_lines.length > 0 ? delta_lines.join('\n') + '\n' : '';
+			const delta_bytes = Bun.gzipSync(Buffer.from(delta_text, 'utf8'));
+
+			await v3_atomic_write(path.join(V3_TACT_DIR, `delta-${old_sha}-${sha}.txt.gz`), delta_bytes);
+			log(`v3 tact delta {${old_sha.substring(0, 8)}} -> {${sha.substring(0, 8)}}: {${delta_lines.length}} operations`);
+		} catch (e) {
+			caution('v3 tact delta failed', { old_sha, sha, error: e instanceof Error ? e.message : String(e) });
+		}
+	}
+
+	history.unshift(sha);
+	history = history.slice(0, V3_TACT_RETAIN);
+	await v3_atomic_write(path.join(V3_TACT_DIR, 'manifest.json'), JSON.stringify(history));
+
+	const version = { sha, entries: entries.size, size: raw.length, compressed: full_bytes.length };
+	await v3_atomic_write(path.join(V3_TACT_DIR, 'version.json'), JSON.stringify(version));
+
+	const keep = new Set(history);
+	const files = await fs.readdir(V3_TACT_DIR);
+
+	for (const file of files) {
+		const full_match = file.match(/^full-([a-f0-9]{40})\.txt\.gz$/);
+		if (full_match && !keep.has(full_match[1]!)) {
+			await fs.unlink(path.join(V3_TACT_DIR, file)).catch(() => {});
+			continue;
+		}
+
+		const delta_match = file.match(/^delta-[a-f0-9]{40}-([a-f0-9]{40})\.txt\.gz$/);
+		if (delta_match && delta_match[1] !== sha)
+			await fs.unlink(path.join(V3_TACT_DIR, file)).catch(() => {});
+	}
+
+	log(`v3 tact keys published {${sha.substring(0, 8)}} ({${entries.size}} keys)`);
+}
+
 async function update_tact() {
-	const url = 'https://raw.githubusercontent.com/wowdev/TACTKeys/master/WoW.txt';
 	const target_dir = './wow.export/data/tact';
-	
-	await download_and_store(url, target_dir, 'wow', 'tact');
+	let remote_sha: string;
+
+	try {
+		const version_res = await fetch('https://api.github.com/repos/wowdev/TACTKeys/git/refs/heads/master');
+		if (!version_res.ok) {
+			caution('Failed to check tact keys version', { status: version_res.status });
+			return;
+		}
+
+		const remote_head = await version_res.json() as any;
+		const sha = remote_head?.object?.sha;
+
+		if (typeof sha !== 'string' || !V3_TACT_SHA_PATTERN.test(sha)) {
+			caution('Failed to parse tact keys version', { remote_head });
+			return;
+		}
+
+		remote_sha = sha;
+	} catch (error) {
+		caution('Failed to check tact keys version', [error instanceof Error ? error.message : String(error)]);
+		return;
+	}
+
+	try {
+		const v3_version = await Bun.file(path.join(V3_TACT_DIR, 'version.json')).json();
+		if (v3_version?.sha === remote_sha) {
+			log(`tact keys are up to date ({${remote_sha.substring(0, 8)}})`);
+			return;
+		}
+	} catch {}
+
+	let text: string;
+
+	try {
+		const res = await fetch('https://raw.githubusercontent.com/wowdev/TACTKeys/master/WoW.txt');
+		if (!res.ok) {
+			caution('Failed to download tact keys', { status: res.status });
+			return;
+		}
+
+		text = await res.text();
+	} catch (error) {
+		caution('Failed to download tact keys', [error instanceof Error ? error.message : String(error)]);
+		return;
+	}
+
+	const entries = v3_tact_normalize(text);
+	if (entries.size === 0) {
+		caution('tact keys normalization produced no entries', { sha: remote_sha });
+		return;
+	}
+
+	try {
+		await fs.mkdir(target_dir, { recursive: true });
+		await v3_atomic_write(path.join(target_dir, 'wow'), text);
+		await v3_tact_build(remote_sha, entries);
+	} catch (error) {
+		caution('Failed to build v3 tact keys', [error instanceof Error ? error.message : String(error)]);
+	}
 }
 
 let index: string|null = null;
@@ -1638,6 +1807,55 @@ export async function init(server: SpooderServer) {
 			return HTTP_STATUS_CODE.BadRequest_400;
 
 		const file = Bun.file(path.join(V3_LISTFILE_DIR, `delta-${from}-${to}.csv.gz`));
+		if (!await file.exists())
+			return HTTP_STATUS_CODE.NotFound_404;
+
+		return new Response(file, {
+			headers: {
+				'Content-Type': 'application/gzip',
+				'Cache-Control': 'public, max-age=31536000, immutable'
+			}
+		});
+	});
+
+	server.route('/wow.export/v3/tact/version', async () => {
+		const file = Bun.file(path.join(V3_TACT_DIR, 'version.json'));
+		if (!await file.exists())
+			return HTTP_STATUS_CODE.NotFound_404;
+
+		return new Response(file, {
+			headers: {
+				'Content-Type': 'application/json',
+				'Cache-Control': 'no-cache'
+			}
+		});
+	});
+
+	server.route('/wow.export/v3/tact/full/:sha', async (req, url) => {
+		const sha = url.searchParams.get('sha');
+		if (sha === null || !V3_TACT_SHA_PATTERN.test(sha))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		const file = Bun.file(path.join(V3_TACT_DIR, `full-${sha}.txt.gz`));
+		if (!await file.exists())
+			return HTTP_STATUS_CODE.NotFound_404;
+
+		return new Response(file, {
+			headers: {
+				'Content-Type': 'application/gzip',
+				'Cache-Control': 'public, max-age=31536000, immutable'
+			}
+		});
+	});
+
+	server.route('/wow.export/v3/tact/delta/:from/:to', async (req, url) => {
+		const from = url.searchParams.get('from');
+		const to = url.searchParams.get('to');
+
+		if (from === null || to === null || !V3_TACT_SHA_PATTERN.test(from) || !V3_TACT_SHA_PATTERN.test(to))
+			return HTTP_STATUS_CODE.BadRequest_400;
+
+		const file = Bun.file(path.join(V3_TACT_DIR, `delta-${from}-${to}.txt.gz`));
 		if (!await file.exists())
 			return HTTP_STATUS_CODE.NotFound_404;
 
@@ -1971,15 +2189,19 @@ export async function init(server: SpooderServer) {
 		return 200;
 	});
 
-	server.webhook(process.env.LISTFILE_WEBHOOK_SECRET!, '/wow.export/v2/trigger_tact_rebuild', (payload) => {
-		setImmediate(async () => {
-			if (is_updating_tact)
-				return;
+	async function trigger_tact_update() {
+		if (is_updating_tact)
+			return;
 
-			is_updating_tact = true;
-			await update_tact();
-			is_updating_tact = false;
-		});
+		is_updating_tact = true;
+		await update_tact();
+		is_updating_tact = false;
+	}
+
+	trigger_tact_update(); // update tact keys on server start
+
+	server.webhook(process.env.LISTFILE_WEBHOOK_SECRET!, '/wow.export/v2/trigger_tact_rebuild', (payload) => {
+		setImmediate(trigger_tact_update);
 		return 200;
 	});
 
