@@ -1,5 +1,6 @@
 import { http_serve, caution, parse_template, HTTP_STATUS_CODE, ErrorWithMetadata } from 'spooder';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import os from 'node:os';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -1170,6 +1171,7 @@ async function b_listfile_write_fat_files(target_dir: string, entries: ListfileE
 const V3_LISTFILE_DIR = './wow.export/data/listfile/v3';
 const V3_LISTFILE_RETAIN = 10;
 const V3_LISTFILE_SHA_PATTERN = /^[a-f0-9]{40}$/;
+const V3_LISTFILE_MAX_SIZE = 1024 * 1024 * 1024;
 
 function v3_listfile_normalize(csv_content: string): Map<number, string> {
 	const entries = new Map<number, string>();
@@ -1239,7 +1241,9 @@ async function v3_listfile_build(sha: string, csv_content: string): Promise<void
 			continue;
 
 		try {
-			const old_text = Bun.gunzipSync(Buffer.from(await old_file.arrayBuffer())).toString('utf8');
+			// Bun.gunzipSync throws RangeError on large outputs, use node:zlib instead
+			const old_compressed = Buffer.from(await old_file.arrayBuffer());
+			const old_text = zlib.gunzipSync(old_compressed, { maxOutputLength: V3_LISTFILE_MAX_SIZE }).toString('utf8');
 			const old_entries = v3_listfile_normalize(old_text);
 			const delta_lines: string[] = [];
 
