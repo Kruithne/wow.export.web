@@ -414,6 +414,7 @@ async function kino_process_queue(): Promise<void> {
 const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
 
 const CACHE_MAX_RETRIES = 2;
+const CACHE_RETRY_BACKOFF = 30000;
 
 const cache_queue: string[] = [];
 const cache_retry_counts = new Map<string, number>();
@@ -448,13 +449,19 @@ function spawn_cache_worker(): Worker {
 		const submission_id = cache_worker_submission;
 		cache_worker = null;
 		cache_worker_submission = null;
+		let backoff = 0;
 
 		if (!done_received && submission_id !== null) {
 			const attempts = (cache_retry_counts.get(submission_id) ?? 0) + 1;
 			if (attempts <= CACHE_MAX_RETRIES) {
 				cache_retry_counts.set(submission_id, attempts);
 				cache_queue.push(submission_id);
-				log(`cache worker died on {${submission_id}}, requeued (attempt ${attempts}/${CACHE_MAX_RETRIES})`);
+
+				// a crash caused by resource exhaustion (db connections, memory) is
+				// still exhausted a millisecond later; respawning immediately just
+				// burns the remaining attempts and deepens the hole
+				backoff = CACHE_RETRY_BACKOFF * attempts;
+				log(`cache worker died on {${submission_id}}, requeued in ${backoff}ms (attempt ${attempts}/${CACHE_MAX_RETRIES})`);
 			} else {
 				cache_retry_counts.delete(submission_id);
 				log(`cache worker died on {${submission_id}}, giving up after ${CACHE_MAX_RETRIES} attempts`);
@@ -464,7 +471,10 @@ function spawn_cache_worker(): Worker {
 			cache_retry_counts.delete(submission_id);
 		}
 
-		process_cache_queue();
+		if (backoff > 0)
+			setTimeout(process_cache_queue, backoff);
+		else
+			process_cache_queue();
 	}
 
 	worker.onmessage = (event: MessageEvent) => {
