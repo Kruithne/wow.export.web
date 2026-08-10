@@ -1,0 +1,91 @@
+{
+	"entries": [
+		{
+			"id": "ibelin",
+			"link": "https://www.netflix.com/gb/title/81759420",
+			"background": "showcase_ibelin_bg.webp",
+			"layers": [
+				{ "image": "show_netflix_logo.webp", "anchor": "top-left", "height": 44, "inset": 25 },
+				{ "image": "showcase_ibelin_logo.webp", "anchor": "bottom-left", "height": 87, "inset": 25 }
+			]
+		},
+		{
+			"id": "hench_scrap",
+			"link": "https://henchandscrap.com/",
+			"video": "showcase_hench_bg.webm",
+			"layers": [
+				{ "image": "showcase_hench_scrap_logo.webp", "anchor": "top-left", "height": 116, "inset": 20 }
+			]
+		},
+		{
+			"id": "bombowy",
+			"link": "https://www.youtube.com/@BombowyKurczak",
+			"video": "showcase_bombowy_bg.webm",
+			"title": "BOMBOWYS LITTLE TALES",
+			"layers": [
+				{ "image": "showcase_bombowy_icon.webp", "anchor": "bottom-left", "height": 72, "inset": 20 }
+			]
+		},
+		{
+			"id": "ttp",
+			"link": "https://www.youtube.com/channel/UCh2XRQw9C7XXa58E0ZTmx6A",
+			"video": "showcase_ttp_bg.webm",
+			"title": "TEAM TRUE POTENTIAL",
+			"layers": [
+				{ "image": "showcase_ttp_icon.webp", "anchor": "bottom-left", "height": 68, "inset": 20 }
+			]
+		},
+		{
+			"id": "mdi",
+			"link": "https://www.youtube.com/results?search_query=mythic+dungeon+invitational+trailer",
+			"video": "showcase_mdi_bg.webm",
+			"title": "BLIZZARD: MDI TRAILERS",
+			"layers": [
+				{ "image": "showcase_mdi_icon.webp", "anchor": "bottom-left", "height": 72, "inset": 20 }
+			]
+		},
+		{
+			"id": "awc",
+			"link": "https://www.youtube.com/results?search_query=wow+awc+trailer",
+			"video": "showcase_awc_bg.webm",
+			"title": "BLIZZARD: AWC TRAILERS",
+			"layers": [
+				{ "image": "showcase_awc_icon.webp", "anchor": "bottom-left", "height": 72, "inset": 20 }
+			]
+		},
+		{
+			"id": "ikedit",
+			"link": "https://www.youtube.com/@IKedit",
+			"video": "showcase_ikedit_bg.webm",
+			"layers": [
+				{ "image": "showcase_ikedit_logo.webp", "anchor": "bottom-left", "height": 87, "inset": 20 }
+			]
+		},
+		{
+			"id": "hurricane",
+			"link": "https://www.youtube.com/@Hurricane046",
+			"video": "showcase_hurricane_bg.webm",
+			"title": "Hurricane",
+			"layers": [
+				{ "image": "showcase_hurricane_icon.webp", "anchor": "bottom-left", "height": 72, "inset": 20 }
+			]
+		},
+		{
+			"id": "wiw",
+			"link": "https://www.whereinwarcraft.net/",
+			"video": "showcase_wiw_bg.webm",
+			"layers": [
+				{ "image": "showcase_wiw_logo.webp", "anchor": "top-left", "height": 128, "inset": 20 },
+				{ "image": "showcase_wiw_icon.webp", "anchor": "bottom-left", "height": 72, "inset": 20 }
+			]
+		},
+		{
+			"id": "720",
+			"link": "https://www.youtube.com/@720zone",
+			"video": "showcase_720_bg.webm",
+			"layers": [
+				{ "image": "showcase_720_icon.webp", "anchor": "bottom-left", "height": 48, "inset": 20 }
+			]
+		}
+	]
+}
