@@ -50,6 +50,14 @@ self.onmessage = async (event: MessageEvent) => {
 		caution('cache: failed to process submission', { submission_id, error: e });
 	}
 
+	// worker.terminate() kills the thread without a clean mysql disconnect,
+	// stranding pooled connections server-side until wait_timeout (4h)
+	try {
+		await db_archavon.end();
+	} catch (e) {
+		caution('cache: failed to close db pool', { submission_id, error: e });
+	}
+
 	self.postMessage({ type: 'done' });
 };
 
