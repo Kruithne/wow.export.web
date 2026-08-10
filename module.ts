@@ -422,6 +422,11 @@ const CACHE_BACKLOG_AGE = 24;
 const CACHE_BACKLOG_INTERVAL = 60000;
 const CACHE_BACKLOG_LOOKAHEAD = 32;
 
+// grace period before a terminally failed submission has its CDN objects
+// released, leaving a window to diagnose or replay before the data is gone
+const CACHE_REAP_AGE = 30;
+const CACHE_REAP_BATCH = 200;
+
 const cache_queue: string[] = [];
 const cache_retry_counts = new Map<string, number>();
 const cache_backlog_attempted = new Set<string>();
@@ -626,6 +631,9 @@ setInterval(() => {
 // prune stale submissions hourly
 setInterval(cache_cleanup_stale, 60 * 60 * 1000);
 
+// release CDN objects held by long-dead submissions hourly
+setInterval(cache_reap_failed, 60 * 60 * 1000);
+
 // drain replay backlog only while otherwise idle
 setInterval(cache_drain_backlog, CACHE_BACKLOG_INTERVAL);
 
@@ -676,6 +684,47 @@ async function cache_cleanup_stale() {
 		log(`cache stale cleanup: removed ${stale.length} submissions, ${files.length} CDN objects`);
 	} catch (e) {
 		caution('cache: stale cleanup failed', { error: e });
+	}
+}
+
+// a failed submission keeps its uploaded objects on the CDN forever unless
+// something releases them; this leaked ~82GB across 74.6k objects before the
+// worker connection exhaustion was fixed
+async function cache_reap_failed() {
+	try {
+		const files = await db_archavon`
+			SELECT f.object_id FROM cache_submission_files f
+			JOIN cache_submissions s ON s.submission_id = f.submission_id
+			WHERE f.status = 'pending' AND s.status = 'failed'
+			AND s.processed_at <= NOW() - INTERVAL ${CACHE_REAP_AGE} DAY
+			LIMIT ${CACHE_REAP_BATCH}
+		`;
+
+		if (files.length === 0)
+			return;
+
+		const reaped: string[] = [];
+		for (const file of files) {
+			try {
+				if (await cache_bucket.delete(file.object_id))
+					reaped.push(file.object_id);
+			} catch (e) {
+				log(`failed to reap CDN object {${file.object_id}}: ${(e as Error).message}`);
+			}
+		}
+
+		if (reaped.length === 0)
+			return;
+
+		await db_archavon`
+			UPDATE cache_submission_files
+			SET status = 'rejected', failure_reason = 'purged'
+			WHERE object_id IN ${db_archavon(reaped)}
+		`;
+
+		log(`cache reaped ${reaped.length} CDN objects from failed submissions`);
+	} catch (e) {
+		caution('cache: failed submission reap failed', { error: e });
 	}
 }
 
