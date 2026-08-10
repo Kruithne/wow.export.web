@@ -7,7 +7,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { ColorInput } from 'bun';
 import { db } from './db';
-import { db_archavon } from './db_archavon';
+import { db_archavon, db_archavon_migrate } from './db_archavon';
 import { blte_unpack } from './casc/blte';
 import { tact_load_keys } from './casc/tact';
 import { bucket } from './obj_rds';
@@ -1718,6 +1718,8 @@ let release_builds_v2: Record<string, { version: string; archive: string; setup?
 export { cache_worker_get_memory };
 
 export async function init(server: SpooderServer) {
+	await db_archavon_migrate();
+
 	try {
 		release_builds = await Bun.file(RELEASE_BUILD_FILE).json();
 	} catch (e) {
