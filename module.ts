@@ -416,8 +416,15 @@ const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
 const CACHE_MAX_RETRIES = 2;
 const CACHE_RETRY_BACKOFF = 30000;
 
+// submissions finalized but unprocessed for longer than this are replay
+// backlog rather than live traffic, and are drained one at a time
+const CACHE_BACKLOG_AGE = 24;
+const CACHE_BACKLOG_INTERVAL = 60000;
+const CACHE_BACKLOG_LOOKAHEAD = 32;
+
 const cache_queue: string[] = [];
 const cache_retry_counts = new Map<string, number>();
+const cache_backlog_attempted = new Set<string>();
 let cache_worker: Worker | null = null;
 let cache_worker_submission: string | null = null;
 let cache_worker_memory_resolve: ((data: NodeJS.MemoryUsage) => void) | null = null;
@@ -619,6 +626,9 @@ setInterval(() => {
 // prune stale submissions hourly
 setInterval(cache_cleanup_stale, 60 * 60 * 1000);
 
+// drain replay backlog only while otherwise idle
+setInterval(cache_drain_backlog, CACHE_BACKLOG_INTERVAL);
+
 interface CacheSubmitPayload {
 	machine_id: string;
 	product: string;
@@ -671,10 +681,13 @@ async function cache_cleanup_stale() {
 
 async function cache_recover_pending() {
 	try {
+		// bounded to recent submissions; anything older is replay backlog and is
+		// drained by cache_drain_backlog so a boot can't enqueue thousands at once
 		const pending = await db_archavon`
 			SELECT submission_id FROM cache_submissions
 			WHERE finalized_at IS NOT NULL
 			AND processed_at IS NULL
+			AND finalized_at > NOW() - INTERVAL ${CACHE_BACKLOG_AGE} HOUR
 		`;
 
 		for (const row of pending)
@@ -686,6 +699,38 @@ async function cache_recover_pending() {
 			log(`cache recovered {${pending.length}} pending submissions`);
 	} catch (e) {
 		caution('cache: startup recovery failed', { error: e });
+	}
+}
+
+// pulls a single backlog submission whenever the pipeline is idle, so replayed
+// work never delays live submissions
+async function cache_drain_backlog() {
+	if (cache_queue.length > 0 || cache_worker !== null)
+		return;
+
+	try {
+		const candidates = await db_archavon`
+			SELECT submission_id FROM cache_submissions
+			WHERE finalized_at IS NOT NULL
+			AND processed_at IS NULL
+			AND finalized_at <= NOW() - INTERVAL ${CACHE_BACKLOG_AGE} HOUR
+			ORDER BY finalized_at DESC
+			LIMIT ${CACHE_BACKLOG_LOOKAHEAD}
+		`;
+
+		// process_submission can throw without the worker dying, leaving
+		// processed_at NULL; without this the same row would be re-picked forever
+		const next = candidates.find((row: { submission_id: string }) => !cache_backlog_attempted.has(row.submission_id));
+		if (next === undefined)
+			return;
+
+		cache_backlog_attempted.add(next.submission_id);
+
+		log(`cache backlog drain picked up {${next.submission_id}}`);
+		cache_queue.push(next.submission_id);
+		process_cache_queue();
+	} catch (e) {
+		caution('cache: backlog drain failed', { error: e });
 	}
 }
 
