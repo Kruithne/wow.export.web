@@ -328,7 +328,7 @@ export function archavon_api(options: ClientOptions = {}) {
 	const timeout_ms = options.timeout_ms ?? DEFAULT_TIMEOUT_MS;
 
 	// each attempt re-signs, so a backoff never pushes `created` outside the 5m window
-	async function send(endpoint: string, build: () => { body: string | Uint8Array; headers: Record<string, string> }, opts: RequestOptions = {}): Promise<Response> {
+	async function send(endpoint: string, build: () => { body: string | FormData; headers: Record<string, string> }, opts: RequestOptions = {}): Promise<Response> {
 		if (base_url === '')
 			throw new Error('archavon_api: ARCHAVON_WRITE_URL not configured');
 
@@ -495,17 +495,20 @@ export function archavon_api(options: ClientOptions = {}) {
 			return post_json<PurgeObjectsResult>('intake/cleanup/purged', { object_ids });
 		},
 
-		// idempotent server-side via the delta_applications ledger, so retries are safe
+		// idempotent server-side via the delta_applications ledger, so retries are safe.
+		// multipart, not a raw body: the shared host's proxy truncates raw bodies over
+		// ~2.5MB while multipart arrives intact
 		upload_delta: async (submission_id: string, data: Uint8Array, opts: RequestOptions = {}): Promise<DeltaResult> => {
 			const content_hash = hash_body(data);
 
 			const res = await send('delta', () => {
 				const created = Date.now();
+				const form = new FormData();
+				form.append('file', new Blob([data as BufferSource], { type: 'application/octet-stream' }), 'delta.db');
 
 				return {
-					body: data,
+					body: form,
 					headers: {
-						'Content-Type': 'application/octet-stream',
 						'X-Submission-Id': submission_id,
 						'X-Content-Hash': content_hash,
 						'X-Created': String(created),
