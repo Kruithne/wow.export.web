@@ -7,7 +7,6 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { ColorInput } from 'bun';
 import { db } from './db';
-import { db_archavon } from './db_archavon';
 import { archavon_api, ArchavonApiError, MAX_FILES_PER_REQUEST, MAX_HASHES_PER_REQUEST, type BinaryHashEntry, type FileRef, type SubmissionFileInput } from './archavon_api';
 import { blte_unpack } from './casc/blte';
 import { tact_load_keys } from './casc/tact';
@@ -2297,25 +2296,16 @@ export async function init(server: SpooderServer) {
 
 			const manifest = await res.json() as Array<{ tableName: string, db2FileDataID: number }>;
 
-			const BATCH_SIZE = 500;
 			let total = 0;
 
-			for (let i = 0; i < manifest.length; i += BATCH_SIZE) {
-				const batch = manifest.slice(i, i + BATCH_SIZE);
-				const placeholders: string[] = [];
-				const params: any[] = [];
+			for (let i = 0; i < manifest.length; i += MAX_HASHES_PER_REQUEST) {
+				const batch = manifest.slice(i, i + MAX_HASHES_PER_REQUEST).map(entry => ({
+					table_hash: sstrhash(entry.tableName) >>> 0,
+					table_name: entry.tableName
+				}));
 
-				for (const entry of batch) {
-					placeholders.push('(?, ?)');
-					params.push(sstrhash(entry.tableName) >>> 0, entry.tableName);
-				}
-
-				await db_archavon.unsafe(
-					`INSERT INTO db2_table_hashes (table_hash, table_name) VALUES ${placeholders.join(',')} ON DUPLICATE KEY UPDATE table_name = VALUES(table_name)`,
-					params
-				);
-
-				total += batch.length;
+				const result = await archavon.store_table_hashes(batch);
+				total += result.stored;
 			}
 
 			log(`{WoWDBDefs} table hash mapping updated: {${total}} entries`);
@@ -2450,8 +2440,7 @@ export async function init(server: SpooderServer) {
 
 		const client_ip = get_client_ip(req);
 
-		// ahead of the block check, which is now a signed round-trip that upserts
-		// the machine; a flooding client must not get a write per request
+		// rate limits first; the block check is a signed round-trip that writes
 		if (check_rate_limit(cache_rate_machine, machine_id, CACHE_RATE_MAX_MACHINE))
 			return HTTP_STATUS_CODE.TooManyRequests_429;
 

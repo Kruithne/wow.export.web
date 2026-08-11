@@ -1,15 +1,7 @@
 /*!
-	archavon write API client
-
-	Server-to-server client for the SQLite-backed archavon write API.
-	Contract: F:\archavon\docs\write_api.md
-
-	Signing mirrors obj_rds.ts but is pinned to sha256; the algorithm is never negotiated.
+	archavon write API client; contract: F:\archavon\docs\write_api.md
 		json     signature over the raw request body; body carries `created` (ms)
 		upload   signature over `<content-hash>:<created>:<submission-id>`
-
-	The intake path (module.ts submit/finalize and the cache jobs) and the cache worker
-	both run on this; the worker ships its results as a delta (wdb_delta.ts).
  */
 
 import crypto from 'node:crypto';
@@ -73,6 +65,11 @@ export type BinaryHashStoreResult = {
 	build_key: string;
 	submitted: number;
 	inserted: number;
+};
+
+export type TableHashEntry = {
+	table_hash: number;
+	table_name: string;
 };
 
 export type SubmissionFileInput = {
@@ -277,17 +274,15 @@ export class ArchavonApiError extends Error {
 	}
 }
 
-/** HMAC-sha256 of `message`, hex encoded. */
 export function sign_message(message: string, secret: string): string {
 	return crypto.createHmac(HMAC_ALG, secret).update(message, 'utf8').digest('hex');
 }
 
-/** `X-Signature` value for an already-serialised JSON body. */
 export function sign_json_body(body: string, secret: string): string {
 	return `${HMAC_ALG}=${sign_message(body, secret)}`;
 }
 
-/** `X-Signature` value for a delta upload; signs the claimed body hash, not the body. */
+// signs the claimed body hash, not the body
 export function sign_upload(content_hash: string, created: number, submission_id: string, secret: string): string {
 	return `${HMAC_ALG}=${sign_message(`${content_hash}:${created}:${submission_id}`, secret)}`;
 }
@@ -394,7 +389,7 @@ export function archavon_api(options: ClientOptions = {}) {
 	}
 
 	return {
-		/** Upserts the machine and reports block state; reject the submission when `blocked`. */
+		// upserts the machine and reports block state
 		check_machine: (machine_id: string, hardware_hash?: string): Promise<MachineState> => {
 			const payload: Record<string, unknown> = { machine_id };
 			if (hardware_hash !== undefined)
@@ -403,7 +398,7 @@ export function archavon_api(options: ClientOptions = {}) {
 			return post_json<MachineState>('intake/machine', payload);
 		},
 
-		/** Known binary hashes for a build; omit `file_names` for every file of the build. */
+		// omit file_names to fetch every file of the build
 		get_binary_hashes: (build_key: string, file_names?: string[]): Promise<BinaryHashLookup> => {
 			const payload: Record<string, unknown> = { build_key };
 
@@ -415,38 +410,39 @@ export function archavon_api(options: ClientOptions = {}) {
 			return post_json<BinaryHashLookup>('intake/hashes', payload);
 		},
 
-		/** Stores hashes parsed out of an install manifest; re-storing is a no-op. */
+		// re-storing is a no-op
 		store_binary_hashes: (build_key: string, hashes: BinaryHashEntry[]): Promise<BinaryHashStoreResult> => {
 			assert_limit('hashes', hashes.length, MAX_HASHES_PER_REQUEST);
 
 			return post_json<BinaryHashStoreResult>('intake/hashes/store', { build_key, hashes });
 		},
 
-		/**
-		 * Creates the submission and its file rows; `client_ip` must already be hashed.
-		 *
-		 * Not retried by default: a lost response followed by a retry answers 409, which
-		 * would surface as a failure for a submission that actually landed.
-		 */
+		// db2 table-hash mapping upsert (WoWDBDefs manifest sync)
+		store_table_hashes: (tables: TableHashEntry[]): Promise<{ stored: number }> => {
+			assert_limit('tables', tables.length, MAX_HASHES_PER_REQUEST);
+
+			return post_json<{ stored: number }>('intake/tables/store', { tables });
+		},
+
+		// not retried by default: a lost response + retry answers 409, surfacing as a
+		// failure for a submission that actually landed. client_ip must be pre-hashed
 		create_submission: (req: CreateSubmissionRequest, opts: RequestOptions = { retry_count: 0 }): Promise<CreateSubmissionResult> => {
 			assert_limit('files', req.files.length, MAX_FILES_PER_REQUEST);
 
 			return post_json<CreateSubmissionResult>('intake/submission', req as unknown as Record<string, unknown>, opts);
 		},
 
-		/** Submission + file rows for the stateless finalize/worker path. */
 		get_submission: (submission_id: string): Promise<SubmissionDetail> => {
 			return post_json<SubmissionDetail>('intake/submission/files', { submission_id });
 		},
 
-		/** Closes the submission off; drops files absent from `keep` and returns their object_ids. */
+		// drops files absent from `keep` and returns their object_ids
 		finalize_submission: (submission_id: string, keep: FileRef[]): Promise<FinalizeResult> => {
 			assert_limit('keep', keep.length, MAX_FILES_PER_REQUEST);
 
 			return post_json<FinalizeResult>('intake/submission/finalize', { submission_id, keep });
 		},
 
-		/** Submission-level and per-file status writes; every field but the id is optional. */
 		update_submission_status: (req: UpdateStatusRequest): Promise<UpdateStatusResult> => {
 			if (req.files !== undefined)
 				assert_limit('files', req.files.length, MAX_FILES_PER_REQUEST);
@@ -454,14 +450,13 @@ export function archavon_api(options: ClientOptions = {}) {
 			return post_json<UpdateStatusResult>('intake/submission/status', req as unknown as Record<string, unknown>);
 		},
 
-		/** Deletes submissions and (cascade) their file rows. */
 		delete_submissions: (submission_ids: string[], unfinalized_only = false): Promise<DeleteSubmissionsResult> => {
 			assert_limit('submission_ids', submission_ids.length, MAX_SUBMISSION_IDS_PER_REQUEST);
 
 			return post_json<DeleteSubmissionsResult>('intake/submission/delete', { submission_ids, unfinalized_only });
 		},
 
-		/** Read-only listing of submissions that were never finalized; `max_age_hours` minimum is 1. */
+		// submissions that were never finalized
 		list_stale_submissions: (max_age_hours?: number, limit?: number): Promise<StaleSubmissionsResult> => {
 			const payload: Record<string, unknown> = {};
 
@@ -474,17 +469,13 @@ export function archavon_api(options: ClientOptions = {}) {
 			return post_json<StaleSubmissionsResult>('intake/cleanup/stale', payload);
 		},
 
-		/**
-		 * Finalized submissions that were never processed.
-		 *
-		 * `max_age_hours` bounds it to live traffic (boot recovery), `min_age_hours` to
-		 * replay backlog; undefined fields are dropped by JSON.stringify.
-		 */
+		// finalized but never processed; max_age_hours bounds to live traffic (boot
+		// recovery), min_age_hours to replay backlog
 		list_backlog: (query: BacklogQuery = {}): Promise<BacklogResult> => {
 			return post_json<BacklogResult>('intake/backlog', { ...query });
 		},
 
-		/** CDN objects still held by long-failed submissions; release them, then purge. */
+		// cdn objects still held by long-failed submissions; release, then purge
 		list_reapable_files: (min_age_days?: number, limit?: number): Promise<ReapableFilesResult> => {
 			const payload: Record<string, unknown> = {};
 
@@ -497,18 +488,14 @@ export function archavon_api(options: ClientOptions = {}) {
 			return post_json<ReapableFilesResult>('intake/cleanup/failed', payload);
 		},
 
-		/** Marks released objects `rejected`/`purged`; only pending rows move. */
+		// marks released objects purged; only pending rows move
 		purge_objects: (object_ids: string[]): Promise<PurgeObjectsResult> => {
 			assert_limit('object_ids', object_ids.length, MAX_OBJECT_IDS_PER_REQUEST);
 
 			return post_json<PurgeObjectsResult>('intake/cleanup/purged', { object_ids });
 		},
 
-		/**
-		 * Applies one worker-produced delta database (bun:sqlite `db.serialize()`).
-		 *
-		 * Idempotent server-side via the delta_applications ledger, so retries are safe.
-		 */
+		// idempotent server-side via the delta_applications ledger, so retries are safe
 		upload_delta: async (submission_id: string, data: Uint8Array, opts: RequestOptions = {}): Promise<DeltaResult> => {
 			const content_hash = hash_body(data);
 
