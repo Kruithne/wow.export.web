@@ -8,6 +8,7 @@ import { spawn } from 'node:child_process';
 import { ColorInput } from 'bun';
 import { db } from './db';
 import { db_archavon, db_archavon_migrate } from './db_archavon';
+import { archavon_api, ArchavonApiError, MAX_FILES_PER_REQUEST, MAX_HASHES_PER_REQUEST, type BinaryHashEntry, type FileRef, type SubmissionFileInput } from './archavon_api';
 import { blte_unpack } from './casc/blte';
 import { tact_load_keys } from './casc/tact';
 import { bucket } from './obj_rds';
@@ -414,8 +415,18 @@ async function kino_process_queue(): Promise<void> {
 // region cache collection
 const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
 
+// intake state lives in the archavon sqlite db; this vps only owns the CDN objects
+const archavon = archavon_api();
+
 const CACHE_MAX_RETRIES = 2;
 const CACHE_RETRY_BACKOFF = 30000;
+
+// unfinalized submissions older than this are abandoned uploads
+const CACHE_STALE_AGE = 1;
+
+// boot recovery is bounded by the server-side cap; anything beyond it ages into
+// the backlog window and is drained from there
+const CACHE_RECOVER_LIMIT = 1000;
 
 // submissions finalized but unprocessed for longer than this are replay
 // backlog rather than live traffic, and are drained one at a time
@@ -445,11 +456,7 @@ let cache_worker_memory_resolve: ((data: NodeJS.MemoryUsage) => void) | null = n
 
 async function cache_fail_submission(submission_id: string, reason: string) {
 	try {
-		await db_archavon`
-			UPDATE cache_submissions
-			SET status = 'failed', processed_at = NOW(), status_reason = ${reason}
-			WHERE submission_id = ${submission_id}
-		`;
+		await archavon.update_submission_status({ submission_id, status: 'failed', status_reason: reason });
 	} catch (e) {
 		caution('cache: failed to mark crashed submission', { submission_id, error: e });
 	}
@@ -667,33 +674,26 @@ interface CacheFinalizePayload {
 
 async function cache_cleanup_stale() {
 	try {
-		const stale = await db_archavon`
-			SELECT submission_id FROM cache_submissions
-			WHERE finalized_at IS NULL AND submitted_at < NOW() - INTERVAL 1 HOUR
-		`;
+		const stale = await archavon.list_stale_submissions(CACHE_STALE_AGE);
 
-		if (stale.length === 0)
+		if (stale.count === 0)
 			return;
 
-		const stale_ids = stale.map((r: { submission_id: string }) => r.submission_id);
+		let objects = 0;
+		for (const submission of stale.submissions) {
+			for (const file of submission.files) {
+				objects++;
 
-		const files = await db_archavon`
-			SELECT object_id FROM cache_submission_files
-			WHERE submission_id IN ${db_archavon(stale_ids)}
-		`;
-
-		for (const file of files) {
-			try {
-				await cache_bucket.delete(file.object_id);
-			} catch {}
+				try {
+					await cache_bucket.delete(file.object_id);
+				} catch {}
+			}
 		}
 
-		await db_archavon`
-			DELETE FROM cache_submissions
-			WHERE submission_id IN ${db_archavon(stale_ids)}
-		`;
+		// unfinalized_only, so a submission finalized between the listing and here survives
+		const deleted = await archavon.delete_submissions(stale.submissions.map(s => s.submission_id), true);
 
-		log(`cache stale cleanup: removed ${stale.length} submissions, ${files.length} CDN objects`);
+		log(`cache stale cleanup: removed ${deleted.deleted} submissions, ${objects} CDN objects`);
 	} catch (e) {
 		caution('cache: stale cleanup failed', { error: e });
 	}
@@ -704,19 +704,13 @@ async function cache_cleanup_stale() {
 // worker connection exhaustion was fixed
 async function cache_reap_failed() {
 	try {
-		const files = await db_archavon`
-			SELECT f.object_id FROM cache_submission_files f
-			JOIN cache_submissions s ON s.submission_id = f.submission_id
-			WHERE f.status = 'pending' AND s.status = 'failed'
-			AND s.processed_at <= NOW() - INTERVAL ${CACHE_REAP_AGE} DAY
-			LIMIT ${CACHE_REAP_BATCH}
-		`;
+		const reapable = await archavon.list_reapable_files(CACHE_REAP_AGE, CACHE_REAP_BATCH);
 
-		if (files.length === 0)
+		if (reapable.count === 0)
 			return;
 
 		const reaped: string[] = [];
-		for (const file of files) {
+		for (const file of reapable.files) {
 			try {
 				if (await cache_bucket.delete(file.object_id))
 					reaped.push(file.object_id);
@@ -728,11 +722,7 @@ async function cache_reap_failed() {
 		if (reaped.length === 0)
 			return;
 
-		await db_archavon`
-			UPDATE cache_submission_files
-			SET status = 'rejected', failure_reason = 'purged'
-			WHERE object_id IN ${db_archavon(reaped)}
-		`;
+		await archavon.purge_objects(reaped);
 
 		log(`cache reaped ${reaped.length} CDN objects from failed submissions`);
 	} catch (e) {
@@ -790,20 +780,18 @@ async function cache_recover_pending() {
 	try {
 		// bounded to recent submissions; anything older is replay backlog and is
 		// drained by cache_drain_backlog so a boot can't enqueue thousands at once
-		const pending = await db_archavon`
-			SELECT submission_id FROM cache_submissions
-			WHERE finalized_at IS NOT NULL
-			AND processed_at IS NULL
-			AND finalized_at > NOW() - INTERVAL ${CACHE_BACKLOG_AGE} HOUR
-		`;
+		const pending = await archavon.list_backlog({ max_age_hours: CACHE_BACKLOG_AGE, limit: CACHE_RECOVER_LIMIT });
 
-		for (const row of pending)
+		for (const row of pending.submissions)
 			cache_queue.push(row.submission_id);
 
 		process_cache_queue();
 
-		if (pending.length > 0)
-			log(`cache recovered {${pending.length}} pending submissions`);
+		if (pending.count > 0)
+			log(`cache recovered {${pending.count}} pending submissions`);
+
+		if (pending.count === CACHE_RECOVER_LIMIT)
+			log(`cache recovery hit the ${CACHE_RECOVER_LIMIT} ceiling, remainder deferred to the backlog drain`);
 	} catch (e) {
 		caution('cache: startup recovery failed', { error: e });
 	}
@@ -816,18 +804,15 @@ async function cache_drain_backlog() {
 		return;
 
 	try {
-		const candidates = await db_archavon`
-			SELECT submission_id FROM cache_submissions
-			WHERE finalized_at IS NOT NULL
-			AND processed_at IS NULL
-			AND finalized_at <= NOW() - INTERVAL ${CACHE_BACKLOG_AGE} HOUR
-			ORDER BY finalized_at DESC
-			LIMIT ${CACHE_BACKLOG_LOOKAHEAD}
-		`;
+		const candidates = await archavon.list_backlog({
+			min_age_hours: CACHE_BACKLOG_AGE,
+			limit: CACHE_BACKLOG_LOOKAHEAD,
+			order: 'newest'
+		});
 
 		// process_submission can throw without the worker dying, leaving
 		// processed_at NULL; without this the same row would be re-picked forever
-		const next = candidates.find((row: { submission_id: string }) => !cache_backlog_attempted.has(row.submission_id));
+		const next = candidates.submissions.find(row => !cache_backlog_attempted.has(row.submission_id));
 		if (next === undefined)
 			return;
 
@@ -849,14 +834,9 @@ function cache_is_valid_uuid(str: unknown): boolean {
 	return typeof str === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(str);
 }
 
+// parses the build's INSTALL manifest and stores the binary hashes it carries;
+// the caller checks `known` first, so this only runs for a build we've not seen
 async function cache_fetch_build_hashes(build_key: string): Promise<void> {
-	const existing = await db_archavon`
-		SELECT 1 FROM cache_binary_hashes WHERE build_key = ${build_key} LIMIT 1
-	`;
-
-	if (existing.length > 0)
-		return;
-
 	try {
 		const config_res = await casc_download(casc_url_join(casc_cdn_path, 'config', casc_format_key(build_key)));
 		const config_text = await config_res.text();
@@ -901,7 +881,7 @@ async function cache_fetch_build_hashes(build_key: string): Promise<void> {
 		}
 
 		// read files
-		const executables: Array<{ file_name: string; content_hash: string; file_size: number }> = [];
+		const executables: BinaryHashEntry[] = [];
 		for (let i = 0; i < num_files; i++) {
 			const name = reader.readNullTermString();
 			const hash = reader.readHexString(hash_size);
@@ -918,14 +898,8 @@ async function cache_fetch_build_hashes(build_key: string): Promise<void> {
 		if (executables.length === 0)
 			return;
 
-		const rows = executables.map(e => ({
-			build_key,
-			file_name: e.file_name,
-			content_hash: e.content_hash,
-			file_size: e.file_size
-		}));
-
-		await db_archavon`INSERT INTO cache_binary_hashes ${db_archavon(rows)}`;
+		for (let i = 0; i < executables.length; i += MAX_HASHES_PER_REQUEST)
+			await archavon.store_binary_hashes(build_key, executables.slice(i, i + MAX_HASHES_PER_REQUEST));
 	} catch (e) {
 		caution('cache: failed to fetch build hashes', { build_key, error: e });
 	}
@@ -2536,18 +2510,18 @@ export async function init(server: SpooderServer) {
 
 		const client_ip = get_client_ip(req);
 
-		const [machine] = await db_archavon`
-			SELECT blocked FROM machines WHERE machine_id = ${machine_id}
-		`;
-
-		if (machine?.blocked)
-			return HTTP_STATUS_CODE.Forbidden_403;
-
+		// ahead of the block check, which is now a signed round-trip that upserts
+		// the machine; a flooding client must not get a write per request
 		if (check_rate_limit(cache_rate_machine, machine_id, CACHE_RATE_MAX_MACHINE))
 			return HTTP_STATUS_CODE.TooManyRequests_429;
 
 		if (check_rate_limit(cache_rate_ip, client_ip, CACHE_RATE_MAX_IP))
 			return HTTP_STATUS_CODE.TooManyRequests_429;
+
+		const machine = await archavon.check_machine(machine_id);
+
+		if (machine.blocked)
+			return HTTP_STATUS_CODE.Forbidden_403;
 
 		if (typeof product !== 'string' || product.length === 0 || product.length > 32 || !CACHE_PRODUCT_PATTERN.test(product))
 			return HTTP_STATUS_CODE.BadRequest_400;
@@ -2573,7 +2547,7 @@ export async function init(server: SpooderServer) {
 		}
 
 		const submitted_names = Object.keys(binary_hashes);
-		if (submitted_names.length === 0)
+		if (submitted_names.length === 0 || submitted_names.length > MAX_FILES_PER_REQUEST)
 			return HTTP_STATUS_CODE.BadRequest_400;
 
 		for (const [name, hash] of Object.entries(binary_hashes)) {
@@ -2584,7 +2558,7 @@ export async function init(server: SpooderServer) {
 				return HTTP_STATUS_CODE.BadRequest_400;
 		}
 
-		if (!Array.isArray(files) || files.length === 0)
+		if (!Array.isArray(files) || files.length === 0 || files.length > MAX_FILES_PER_REQUEST)
 			return HTTP_STATUS_CODE.BadRequest_400;
 
 		for (const file of files) {
@@ -2613,31 +2587,23 @@ export async function init(server: SpooderServer) {
 		}
 
 		await casc_ready;
-		await cache_fetch_build_hashes(build_key);
 
-		const known_hashes_rows = await db_archavon`
-			SELECT file_name, content_hash FROM cache_binary_hashes
-			WHERE build_key = ${build_key} AND file_name IN ${db_archavon(submitted_names)}
-		`;
-
-		// no known hashes for this build, cannot verify
-		if (known_hashes_rows.length === 0)
-			return HTTP_STATUS_CODE.Forbidden_403;
-
-		// group known hashes by file_name (duplicates exist for multi-arch builds)
-		const valid_hashes = new Map<string, Set<string>>();
-		for (const row of known_hashes_rows) {
-			let set = valid_hashes.get(row.file_name);
-			if (!set) {
-				set = new Set();
-				valid_hashes.set(row.file_name, set);
-			}
-			set.add(row.content_hash);
+		// `known` covers the whole build, so a cold build costs the manifest fetch
+		// once and every later submission for it is a single lookup
+		let known_hashes = await archavon.get_binary_hashes(build_key, submitted_names);
+		if (!known_hashes.known) {
+			await cache_fetch_build_hashes(build_key);
+			known_hashes = await archavon.get_binary_hashes(build_key, submitted_names);
 		}
 
-		// reject if any matched file has a hash not in the known set
-		for (const [name, set] of valid_hashes) {
-			if (!set.has(binary_hashes[name]!))
+		// no known hashes for this build, cannot verify
+		if (Object.keys(known_hashes.hashes).length === 0)
+			return HTTP_STATUS_CODE.Forbidden_403;
+
+		// reject if any matched file has a hash not in the known set; several
+		// hashes per name are expected, multi-arch builds ship one binary each
+		for (const [name, entries] of Object.entries(known_hashes.hashes)) {
+			if (!entries.some(entry => entry.content_hash === binary_hashes[name]))
 				return HTTP_STATUS_CODE.Forbidden_403;
 		}
 
@@ -2646,7 +2612,7 @@ export async function init(server: SpooderServer) {
 
 		try {
 			const upload_urls: Record<string, string> = {};
-			const file_rows: Array<{ submission_id: string; file_name: string; locale: string; file_size: number; object_id: string; modified_at: Date }> = [];
+			const file_rows: SubmissionFileInput[] = [];
 
 			for (const file of files) {
 				const file_key = `${file.locale}/${file.name}`;
@@ -2659,25 +2625,28 @@ export async function init(server: SpooderServer) {
 				upload_urls[file_key] = cache_bucket.presign(object_id, undefined, 'upload');
 
 				file_rows.push({
-					submission_id,
 					file_name: file.name,
 					locale: file.locale,
 					file_size: file.size,
 					object_id,
-					modified_at: new Date(file.modified_at)
+					modified_at: file.modified_at
 				});
 			}
 
 			const client_ip_hash = crypto.createHash('sha256').update(client_ip).digest('hex');
 
-			const binary_hash_json = JSON.stringify(binary_hashes);
-
-			await db_archavon`
-				INSERT INTO cache_submissions (submission_id, machine_id, product, patch, build_number, build_key, cdn_key, binary_hash, client_ip)
-				VALUES (${submission_id}, ${machine_id}, ${product}, ${patch}, ${build_number}, ${build_key}, ${cdn_key}, ${binary_hash_json}, ${client_ip_hash})
-			`;
-
-			await db_archavon`INSERT INTO cache_submission_files ${db_archavon(file_rows)}`;
+			await archavon.create_submission({
+				submission_id,
+				machine_id,
+				product,
+				patch,
+				build_number,
+				build_key,
+				cdn_key,
+				binary_hash: binary_hashes,
+				client_ip: client_ip_hash,
+				files: file_rows
+			});
 
 			return { submission_id, upload_urls };
 		} catch (e) {
@@ -2706,32 +2675,26 @@ export async function init(server: SpooderServer) {
 			return HTTP_STATUS_CODE.BadRequest_400;
 
 		try {
-			const submissions = await db_archavon`
-				SELECT submission_id, finalized_at FROM cache_submissions
-				WHERE submission_id = ${submission_id}
-			`;
+			const submission = await archavon.get_submission(submission_id);
 
-			if (submissions.length === 0)
-				return HTTP_STATUS_CODE.NotFound_404;
-
-			if (submissions[0].finalized_at !== null)
+			if (submission.finalized_at !== null)
 				return HTTP_STATUS_CODE.Conflict_409;
 
-			const files = await db_archavon`
-				SELECT file_name, locale, object_id FROM cache_submission_files
-				WHERE submission_id = ${submission_id}
-			`;
+			// CDN work first, state last; the file rows of everything absent from
+			// `keep` are dropped by the finalize call
+			const keep: FileRef[] = [];
 
-			for (const file of files) {
+			for (const file of submission.files) {
 				const file_key = `${file.locale}/${file.file_name}`;
 				const checksum = checksums[file_key];
 
 				if (typeof checksum !== 'string') {
 					log(`cache file not uploaded {${file.object_id}}, cleaning up`);
 					await cache_bucket.delete(file.object_id);
-					await db_archavon`DELETE FROM cache_submission_files WHERE object_id = ${file.object_id}`;
 					continue;
 				}
+
+				keep.push({ file_name: file.file_name, locale: file.locale });
 
 				try {
 					await cache_bucket.finalize(file.object_id, checksum);
@@ -2740,16 +2703,19 @@ export async function init(server: SpooderServer) {
 				}
 			}
 
-			await db_archavon`
-				UPDATE cache_submissions SET finalized_at = NOW(), status = 'finalized'
-				WHERE submission_id = ${submission_id}
-			`;
+			await archavon.finalize_submission(submission_id, keep);
 
 			cache_queue.push(submission_id);
 			process_cache_queue();
 
 			return { success: true };
 		} catch (e) {
+			if (e instanceof ArchavonApiError && e.status === 404)
+				return HTTP_STATUS_CODE.NotFound_404;
+
+			if (e instanceof ArchavonApiError && e.status === 409)
+				return HTTP_STATUS_CODE.Conflict_409;
+
 			caution('cache finalize failed', { error: e, submission_id });
 			return HTTP_STATUS_CODE.InternalServerError_500;
 		}

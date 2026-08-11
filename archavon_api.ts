@@ -8,7 +8,8 @@
 		json     signature over the raw request body; body carries `created` (ms)
 		upload   signature over `<content-hash>:<created>:<submission-id>`
 
-	No pipeline wiring; call sites are migrated separately.
+	The intake path (module.ts submit/finalize and the cache jobs) runs on this; the
+	worker still writes through db_archavon until it is converted.
  */
 
 import crypto from 'node:crypto';
@@ -28,6 +29,7 @@ const RETRY_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 export const MAX_FILES_PER_REQUEST = 256;
 export const MAX_HASHES_PER_REQUEST = 1024;
 export const MAX_SUBMISSION_IDS_PER_REQUEST = 500;
+export const MAX_OBJECT_IDS_PER_REQUEST = 500;
 
 export const FILE_STATUS = ['pending', 'completed', 'rejected'] as const;
 export const FAILURE_REASONS = ['download_failed', 'checksum_mismatch', 'invalid_magic', 'parse_error', 'no_records', 'unknown_signature', 'purged'] as const;
@@ -182,6 +184,45 @@ export type StaleSubmissionsResult = {
 	max_age_hours: number;
 	count: number;
 	submissions: StaleSubmission[];
+};
+
+export type BacklogOrder = 'newest' | 'oldest';
+
+export type BacklogQuery = {
+	min_age_hours?: number;
+	max_age_hours?: number;
+	limit?: number;
+	order?: BacklogOrder;
+};
+
+export type BacklogSubmission = {
+	submission_id: string;
+	finalized_at: string;
+	status: SubmissionStatus;
+};
+
+export type BacklogResult = {
+	min_age_hours: number | null;
+	max_age_hours: number | null;
+	order: BacklogOrder;
+	count: number;
+	submissions: BacklogSubmission[];
+};
+
+export type ReapableFile = FileRef & {
+	submission_id: string;
+	object_id: string;
+};
+
+export type ReapableFilesResult = {
+	min_age_days: number;
+	count: number;
+	files: ReapableFile[];
+};
+
+export type PurgeObjectsResult = {
+	requested: number;
+	purged: number;
 };
 
 export type DeltaEntityCounts = Record<string, number>;
@@ -431,6 +472,36 @@ export function archavon_api(options: ClientOptions = {}) {
 				payload.limit = limit;
 
 			return post_json<StaleSubmissionsResult>('intake/cleanup/stale', payload);
+		},
+
+		/**
+		 * Finalized submissions that were never processed.
+		 *
+		 * `max_age_hours` bounds it to live traffic (boot recovery), `min_age_hours` to
+		 * replay backlog; undefined fields are dropped by JSON.stringify.
+		 */
+		list_backlog: (query: BacklogQuery = {}): Promise<BacklogResult> => {
+			return post_json<BacklogResult>('intake/backlog', { ...query });
+		},
+
+		/** CDN objects still held by long-failed submissions; release them, then purge. */
+		list_reapable_files: (min_age_days?: number, limit?: number): Promise<ReapableFilesResult> => {
+			const payload: Record<string, unknown> = {};
+
+			if (min_age_days !== undefined)
+				payload.min_age_days = min_age_days;
+
+			if (limit !== undefined)
+				payload.limit = limit;
+
+			return post_json<ReapableFilesResult>('intake/cleanup/failed', payload);
+		},
+
+		/** Marks released objects `rejected`/`purged`; only pending rows move. */
+		purge_objects: (object_ids: string[]): Promise<PurgeObjectsResult> => {
+			assert_limit('object_ids', object_ids.length, MAX_OBJECT_IDS_PER_REQUEST);
+
+			return post_json<PurgeObjectsResult>('intake/cleanup/purged', { object_ids });
 		},
 
 		/**
