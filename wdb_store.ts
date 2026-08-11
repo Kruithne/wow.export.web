@@ -4,6 +4,10 @@ import type { WdbRecord, CreatureRecord, QuestRecord, GameObjectRecord, PageText
 const BATCH_SIZE = 100;
 const CONSENSUS_THRESHOLD = 3;
 
+// attestations outside this window contribute nothing to consensus; the
+// nightly prune in module.ts deletes against the same constant
+export const ATTESTATION_WINDOW_DAYS = 30;
+
 const MAX_CREATURE_DISPLAYS = 4;
 const MAX_QUEST_ITEMS = 6;
 const MAX_CURRENCY_IDS = 2;
@@ -106,7 +110,7 @@ async function store_batch(
 
 	const id_placeholders = entry_ids.map(() => '?').join(', ');
 	await db.unsafe(
-		`UPDATE ${table_name} SET attestation_count = (SELECT COUNT(*) FROM wdb_attestations a WHERE a.entity_type = ? AND a.entry_id = ${table_name}.entry_id AND a.attested_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)) WHERE entry_id IN (${id_placeholders})`,
+		`UPDATE ${table_name} SET attestation_count = (SELECT COUNT(*) FROM wdb_attestations a WHERE a.entity_type = ? AND a.entry_id = ${table_name}.entry_id AND a.attested_at >= DATE_SUB(NOW(), INTERVAL ${ATTESTATION_WINDOW_DAYS} DAY)) WHERE entry_id IN (${id_placeholders})`,
 		[entity_type, ...entry_ids]
 	);
 
@@ -115,7 +119,7 @@ async function store_batch(
 		`UPDATE ${table_name} t SET attestation_count = (
 			SELECT COUNT(*) FROM wdb_attestations a
 			WHERE a.entity_type = ? AND a.entry_id = t.entry_id
-			AND a.attested_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+			AND a.attested_at >= DATE_SUB(NOW(), INTERVAL ${ATTESTATION_WINDOW_DAYS} DAY)
 		) WHERE (record_id, locale, product) IN (
 			SELECT record_id, locale, product FROM (SELECT record_id, locale, product FROM ${table_name} WHERE entry_id IN (${id_placeholders})) sub
 		) AND entry_id NOT IN (${id_placeholders})`,
