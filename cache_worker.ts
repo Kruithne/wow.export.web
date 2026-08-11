@@ -1,35 +1,24 @@
 import { caution } from 'spooder';
-import { db_archavon } from './db_archavon';
 import { bucket } from './obj_rds';
-import { parse_wdb } from './wdb';
+import { parse_wdb, type WdbRecord } from './wdb';
 import { parse_dbcache } from './dbcache';
-import { upsert_machine, store_creatures, store_quests, store_gameobjects, store_pagetext } from './wdb_store';
+import { archavon_api, type FailureReason, type SubmissionFile } from './archavon_api';
+import { WdbDelta } from './wdb_delta';
 
 const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
+const archavon = archavon_api();
 
-const WDB_STORE_MAP: Record<string, typeof store_creatures> = {
-	'WMOB': store_creatures,
-	'WQST': store_quests,
-	'WGOB': store_gameobjects,
-	'WPTX': store_pagetext
+type DeltaAdd = (delta: WdbDelta, records: WdbRecord[], locale: string, product: string, game_build: number) => number;
+
+const WDB_DELTA_MAP: Record<string, DeltaAdd> = {
+	'WMOB': (delta, records, locale, product, build) => delta.add_creatures(records, locale, product, build),
+	'WQST': (delta, records, locale, product, build) => delta.add_quests(records, locale, product, build),
+	'WGOB': (delta, records, locale, product, build) => delta.add_gameobjects(records, locale, product, build),
+	'WPTX': (delta, records, locale, product, build) => delta.add_pagetext(records, locale, product, build)
 };
 
-const WDB_MAGIC_KEYS = new Set(Object.keys(WDB_STORE_MAP));
+const WDB_MAGIC_KEYS = new Set(Object.keys(WDB_DELTA_MAP));
 const XFTH_MAGIC = 0x48544658;
-
-async function reject_file(file: { object_id: string }, reason: string) {
-	try {
-		await cache_bucket.delete(file.object_id);
-	} catch (e) {
-		log(`failed to delete rejected CDN object {${file.object_id}}: ${(e as Error).message}`);
-	}
-
-	try {
-		await db_archavon`UPDATE cache_submission_files SET status = 'rejected', failure_reason = ${reason} WHERE object_id = ${file.object_id}`;
-	} catch (e) {
-		log(`failed to update rejected file row {${file.object_id}}: ${(e as Error).message}`);
-	}
-}
 
 declare var self: Worker;
 
@@ -44,206 +33,162 @@ self.onmessage = async (event: MessageEvent) => {
 	}
 
 	const { submission_id } = event.data;
+
 	try {
 		await process_submission(submission_id);
 	} catch (e) {
 		caution('cache: failed to process submission', { submission_id, error: e });
-	}
 
-	// worker.terminate() kills the thread without a clean mysql disconnect,
-	// stranding pooled connections server-side until wait_timeout (4h)
-	try {
-		await db_archavon.end();
-	} catch (e) {
-		caution('cache: failed to close db pool', { submission_id, error: e });
+		// closing without posting 'done' routes the submission through the retry path;
+		// delta apply is idempotent server-side, so a re-run is safe
+		self.close();
+		return;
 	}
 
 	self.postMessage({ type: 'done' });
 };
 
-async function update_file_status(object_id: string, status: string, failure_reason: string | null, records_added: number) {
-	await db_archavon`
-		UPDATE cache_submission_files
-		SET status = ${status}, failure_reason = ${failure_reason}, records_added = ${records_added}
-		WHERE object_id = ${object_id}
-	`;
+// drops the cdn object and records the file as rejected in the delta
+async function reject_file(delta: WdbDelta, file: SubmissionFile, reason: FailureReason) {
+	try {
+		await cache_bucket.delete(file.object_id);
+	} catch (e) {
+		log(`failed to delete rejected CDN object {${file.object_id}}: ${(e as Error).message}`);
+	}
+
+	delta.set_file_result(file.file_name, file.locale, 'rejected', reason, 0);
 }
 
 async function process_submission(submission_id: string) {
-	const [submission] = await db_archavon`
-		SELECT build_number, machine_id, patch, product
-		FROM cache_submissions
-		WHERE submission_id = ${submission_id}
-	`;
+	const submission = await archavon.get_submission(submission_id).catch(e => {
+		if (e?.status === 404)
+			return null;
 
-	if (!submission) {
+		throw e;
+	});
+
+	if (submission === null) {
 		log(`submission {${submission_id}} not found, skipping`);
 		return;
 	}
 
-	const build_number = submission.build_number as number;
-	const machine_id = submission.machine_id as string;
-	const patch = submission.patch as string;
-	const product = submission.product as string;
+	const { build_number, machine_id, patch, product } = submission;
 
 	log(`submission {${submission_id}} ${product} ${patch}.${build_number} (machine: ${machine_id})`);
 
-	await db_archavon`UPDATE cache_submissions SET status = 'processing' WHERE submission_id = ${submission_id}`;
-	await upsert_machine(db_archavon, machine_id);
+	await archavon.update_submission_status({ submission_id, status: 'processing' });
+	await archavon.check_machine(machine_id);
 
-	const files = await db_archavon`
-		SELECT file_name, locale, object_id
-		FROM cache_submission_files
-		WHERE submission_id = ${submission_id}
-	`;
+	const delta = new WdbDelta(submission_id, machine_id);
 
-	let completed = 0;
-	let rejected = 0;
-	const rejection_reasons: string[] = [];
+	try {
+		let completed = 0;
+		let rejected = 0;
 
-	for (const file of files) {
-		try {
-			const res = await cache_bucket.download(file.object_id);
-			if (!res.ok) {
-				await res.body?.cancel();
-				log(`file {${file.object_id}}: download failed (${res.status}), rejecting`);
-				await reject_file(file, 'download_failed');
-				rejected++;
-				rejection_reasons.push('download_failed');
-				continue;
-			}
-
-			const data = await res.arrayBuffer();
-			if (data.byteLength < 4) {
-				log(`file {${file.object_id}}: too small (${data.byteLength} bytes), rejecting`);
-				await reject_file(file, 'parse_error');
-				rejected++;
-				rejection_reasons.push('parse_error');
-				continue;
-			}
-
-			const magic_view = new DataView(data);
-
-			if (file.file_name.endsWith('.wdb')) {
-				const magic_bytes = new Uint8Array(data, 0, 4);
-				const wdb_sig = String.fromCharCode(magic_bytes[3], magic_bytes[2], magic_bytes[1], magic_bytes[0]);
-
-				if (!WDB_MAGIC_KEYS.has(wdb_sig)) {
-					log(`wdb {${file.locale}/${file.file_name}}: invalid magic "${wdb_sig}", rejecting`);
-					await reject_file(file, 'invalid_magic');
+		for (const file of submission.files) {
+			try {
+				const res = await cache_bucket.download(file.object_id);
+				if (!res.ok) {
+					await res.body?.cancel();
+					log(`file {${file.object_id}}: download failed (${res.status}), rejecting`);
+					await reject_file(delta, file, 'download_failed');
 					rejected++;
-					rejection_reasons.push('invalid_magic');
 					continue;
 				}
 
-				const result = parse_wdb(data, patch, product);
-				if (result) {
+				const data = await res.arrayBuffer();
+				if (data.byteLength < 4) {
+					log(`file {${file.object_id}}: too small (${data.byteLength} bytes), rejecting`);
+					await reject_file(delta, file, 'parse_error');
+					rejected++;
+					continue;
+				}
+
+				const magic_view = new DataView(data);
+
+				if (file.file_name.endsWith('.wdb')) {
+					const magic_bytes = new Uint8Array(data, 0, 4);
+					const wdb_sig = String.fromCharCode(magic_bytes[3], magic_bytes[2], magic_bytes[1], magic_bytes[0]);
+
+					if (!WDB_MAGIC_KEYS.has(wdb_sig)) {
+						log(`wdb {${file.locale}/${file.file_name}}: invalid magic "${wdb_sig}", rejecting`);
+						await reject_file(delta, file, 'invalid_magic');
+						rejected++;
+						continue;
+					}
+
+					const result = parse_wdb(data, patch, product);
+					if (result === null) {
+						log(`wdb {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
+						await reject_file(delta, file, 'parse_error');
+						rejected++;
+						continue;
+					}
+
+					const sig = result.header.signature;
+					const add_fn = WDB_DELTA_MAP[sig];
+
+					if (add_fn === undefined) {
+						log(`wdb {${file.locale}/${file.file_name}}: unknown signature ${sig}, ${result.records.length} records skipped`);
+						await reject_file(delta, file, 'unknown_signature');
+						rejected++;
+						continue;
+					}
+
 					const valid_records = result.records.filter(r => !('parse_error' in r.data));
 					const parse_errors = result.records.length - valid_records.length;
-					const sig = result.header.signature;
-					const store_fn = WDB_STORE_MAP[sig];
-					if (store_fn) {
-						const stored = await store_fn(db_archavon, valid_records, file.locale, product, build_number, machine_id, submission_id);
-						log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, stored ${stored}, ${parse_errors} parse errors (${sig})`);
-						await update_file_status(file.object_id, 'completed', null, stored);
-						completed++;
-					} else {
-						log(`wdb {${file.locale}/${file.file_name}}: unknown signature ${sig}, ${result.records.length} records skipped`);
-						await reject_file(file, 'unknown_signature');
+					const stored = add_fn(delta, valid_records, file.locale, product, build_number);
+
+					log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, stored ${stored}, ${parse_errors} parse errors (${sig})`);
+					delta.set_file_result(file.file_name, file.locale, 'completed', null, stored);
+					completed++;
+				} else if (file.file_name.toLowerCase() === 'dbcache.bin') {
+					const dbcache_magic = magic_view.getUint32(0, true);
+
+					if (dbcache_magic !== XFTH_MAGIC) {
+						log(`dbcache {${file.locale}/${file.file_name}}: invalid magic 0x${(dbcache_magic >>> 0).toString(16)}, rejecting`);
+						await reject_file(delta, file, 'invalid_magic');
 						rejected++;
-						rejection_reasons.push('unknown_signature');
+						continue;
 					}
-				} else {
-					log(`wdb {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
-					await reject_file(file, 'parse_error');
-					rejected++;
-					rejection_reasons.push('parse_error');
-				}
-			} else if (file.file_name.toLowerCase() === 'dbcache.bin') {
-				const dbcache_magic = magic_view.getUint32(0, true);
 
-				if (dbcache_magic !== XFTH_MAGIC) {
-					log(`dbcache {${file.locale}/${file.file_name}}: invalid magic 0x${(dbcache_magic >>> 0).toString(16)}, rejecting`);
-					await reject_file(file, 'invalid_magic');
-					rejected++;
-					rejection_reasons.push('invalid_magic');
-					continue;
-				}
+					const result = parse_dbcache(data);
+					if (result === null) {
+						log(`dbcache {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
+						await reject_file(delta, file, 'parse_error');
+						rejected++;
+						continue;
+					}
 
-				const result = parse_dbcache(data);
-				if (result) {
 					log(`dbcache {${file.locale}/${file.file_name}}: ${result.entries.length} entries, build=${result.header.build}, version=${result.header.version}`);
 
-					const BATCH_SIZE = 500;
-					let inserted = 0;
-
-					for (let i = 0; i < result.entries.length; i += BATCH_SIZE) {
-						const batch = result.entries.slice(i, i + BATCH_SIZE);
-						const placeholders: string[] = [];
-						const params: any[] = [];
-
-						for (const entry of batch) {
-							placeholders.push('(?, ?, ?, ?, ?, ?, ?, ?, ?)');
-							params.push(
-								entry.table_hash >>> 0,
-								entry.record_id >>> 0,
-								entry.push_id >>> 0,
-								entry.unique_id >>> 0,
-								entry.region_id >>> 0,
-								entry.status,
-								build_number,
-								entry.record_data ? Buffer.from(new Uint8Array(entry.record_data)) : null,
-								product
-							);
-						}
-
-						await db_archavon.unsafe(
-							`INSERT INTO hotfix_entries (table_hash, record_id, push_id, unique_id, region_id, status, game_build, data_blob, product) VALUES ${placeholders.join(',')} ON DUPLICATE KEY UPDATE unique_id = IF(VALUES(data_blob) IS NOT NULL AND data_blob IS NULL, VALUES(unique_id), unique_id), region_id = IF(VALUES(data_blob) IS NOT NULL AND data_blob IS NULL, VALUES(region_id), region_id), status = IF(VALUES(data_blob) IS NOT NULL AND data_blob IS NULL, VALUES(status), status), game_build = IF(VALUES(data_blob) IS NOT NULL AND data_blob IS NULL, VALUES(game_build), game_build), data_blob = IF(VALUES(data_blob) IS NOT NULL AND data_blob IS NULL, VALUES(data_blob), data_blob)`,
-							params
-						);
-
-						inserted += batch.length;
-					}
+					const inserted = delta.add_hotfixes(result.entries, product, build_number);
 
 					log(`dbcache {${file.locale}/${file.file_name}}: stored {${inserted}} hotfix entries`);
-					await update_file_status(file.object_id, 'completed', null, inserted);
+					delta.set_file_result(file.file_name, file.locale, 'completed', null, inserted);
 					completed++;
-				} else {
-					log(`dbcache {${file.locale}/${file.file_name}}: failed to parse (${data.byteLength} bytes)`);
-					await reject_file(file, 'parse_error');
-					rejected++;
-					rejection_reasons.push('parse_error');
 				}
+			} catch (e) {
+				log(`failed to process {${file.object_id}}: ${(e as Error).message}`);
+				delta.set_file_result(file.file_name, file.locale, 'rejected', 'download_failed', 0);
+				rejected++;
 			}
-		} catch (e) {
-			log(`failed to download {${file.object_id}}: ${(e as Error).message}`);
-			await update_file_status(file.object_id, 'rejected', 'download_failed', 0);
-			rejected++;
-			rejection_reasons.push('download_failed');
 		}
+
+		const payload = delta.serialize();
+		log(`submission {${submission_id}} delta built: ${payload.byteLength} bytes, ${completed} completed, ${rejected} rejected`);
+
+		// no terminal status call; the apply endpoint owns the per-file writes and the
+		// roll-up, and a failed dispatch throws into the retry path
+		const result = await archavon.upload_delta(submission_id, payload);
+
+		if (result.already_applied) {
+			log(`submission {${submission_id}} delta already applied at ${result.applied_at}`);
+			return;
+		}
+
+		log(`submission {${submission_id}} done: ${result.files_updated} files updated, ${result.attestations} attestations, ${result.hotfixes} hotfixes, consensus +${result.consensus.promoted}/-${result.consensus.demoted} [${result.status}]`);
+	} finally {
+		delta.close();
 	}
-
-	const total = completed + rejected;
-	let status: string;
-	let status_reason: string | null = null;
-
-	if (rejected === 0)
-		status = 'completed';
-	else if (completed === 0)
-		status = 'failed';
-	else
-		status = 'partial';
-
-	if (rejected > 0) {
-		const unique_reasons = [...new Set(rejection_reasons)].join(', ');
-		status_reason = `${completed}/${total} files processed, ${rejected} rejected (${unique_reasons})`;
-	}
-
-	await db_archavon`
-		UPDATE cache_submissions
-		SET processed_at = NOW(), status = ${status}, status_reason = ${status_reason}
-		WHERE submission_id = ${submission_id}
-	`;
-
-	log(`submission {${submission_id}} done: ${completed} completed, ${rejected} rejected [${status}]`);
 }

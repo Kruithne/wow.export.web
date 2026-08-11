@@ -7,14 +7,13 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { ColorInput } from 'bun';
 import { db } from './db';
-import { db_archavon, db_archavon_migrate } from './db_archavon';
+import { db_archavon } from './db_archavon';
 import { archavon_api, ArchavonApiError, MAX_FILES_PER_REQUEST, MAX_HASHES_PER_REQUEST, type BinaryHashEntry, type FileRef, type SubmissionFileInput } from './archavon_api';
 import { blte_unpack } from './casc/blte';
 import { tact_load_keys } from './casc/tact';
 import { bucket } from './obj_rds';
 import { sbt_to_srt } from './subtitles';
 import { sstrhash } from './sstrhash';
-import { ATTESTATION_WINDOW_DAYS } from './wdb_store';
 import BufferReader from './buffer';
 
 const LISTFILE_HASH_THRESHOLD = 100;
@@ -439,14 +438,6 @@ const CACHE_BACKLOG_LOOKAHEAD = 32;
 const CACHE_REAP_AGE = 30;
 const CACHE_REAP_BATCH = 200;
 
-// wdb_attestations regrows unbounded; rows outside the consensus window are
-// dead weight and previously reached 2.16GB / 11.9M rows
-const WDB_PRUNE_INTERVAL = 24 * 60 * 60 * 1000;
-const WDB_PRUNE_BOOT_DELAY = 60000;
-const WDB_PRUNE_BATCH = 25000;
-const WDB_PRUNE_PAUSE = 1000;
-const WDB_PRUNE_MAX_BATCHES = 400;
-
 const cache_queue: string[] = [];
 const cache_retry_counts = new Map<string, number>();
 const cache_backlog_attempted = new Set<string>();
@@ -653,9 +644,6 @@ setInterval(cache_reap_failed, 60 * 60 * 1000);
 // drain replay backlog only while otherwise idle
 setInterval(cache_drain_backlog, CACHE_BACKLOG_INTERVAL);
 
-// prune attestations outside the consensus window daily
-setInterval(wdb_prune_attestations, WDB_PRUNE_INTERVAL);
-
 interface CacheSubmitPayload {
 	machine_id: string;
 	product: string;
@@ -727,52 +715,6 @@ async function cache_reap_failed() {
 		log(`cache reaped ${reaped.length} CDN objects from failed submissions`);
 	} catch (e) {
 		caution('cache: failed submission reap failed', { error: e });
-	}
-}
-
-// deleted in batches rather than one statement; the table has run to millions
-// of dead rows and an unbounded delete means a huge undo log and long locks on
-// shared hosting. pruning cannot change any attestation_count, since rows
-// outside the window already count as zero
-async function wdb_prune_attestations() {
-	const conn = await db_archavon.reserve();
-
-	try {
-		let removed = 0;
-		let batches = 0;
-
-		while (batches < WDB_PRUNE_MAX_BATCHES) {
-			await conn`
-				DELETE FROM wdb_attestations
-				WHERE attested_at < NOW() - INTERVAL ${ATTESTATION_WINDOW_DAYS} DAY
-				LIMIT ${WDB_PRUNE_BATCH}
-			`;
-
-			// read on the reserved connection so it reflects the delete above
-			const [row] = await conn`SELECT ROW_COUNT() AS affected`;
-			const affected = Number(row.affected);
-
-			// < 1 rather than === 0; row_count() reports -1 for statements that
-			// affect nothing, which must not be read as "keep going"
-			if (affected < 1)
-				break;
-
-			removed += affected;
-			batches++;
-
-			// shared hosting; leave the box room to breathe between batches
-			await Bun.sleep(WDB_PRUNE_PAUSE);
-		}
-
-		if (batches === WDB_PRUNE_MAX_BATCHES)
-			log(`wdb prune hit batch ceiling, remaining rows deferred to next run`);
-
-		if (removed > 0)
-			log(`wdb pruned ${removed} attestations older than ${ATTESTATION_WINDOW_DAYS} days`);
-	} catch (e) {
-		caution('wdb: attestation prune failed', { error: e });
-	} finally {
-		conn.release();
 	}
 }
 
@@ -1854,8 +1796,6 @@ let release_builds_v2: Record<string, { version: string; archive: string; setup?
 export { cache_worker_get_memory };
 
 export async function init(server: SpooderServer) {
-	await db_archavon_migrate();
-
 	try {
 		release_builds = await Bun.file(RELEASE_BUILD_FILE).json();
 	} catch (e) {
@@ -2724,7 +2664,4 @@ export async function init(server: SpooderServer) {
 	// cache startup recovery + stale cleanup
 	cache_cleanup_stale();
 	cache_recover_pending();
-
-	// delayed so the prune does not contend with boot recovery
-	setTimeout(wdb_prune_attestations, WDB_PRUNE_BOOT_DELAY);
 }

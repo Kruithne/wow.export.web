@@ -8,8 +8,8 @@
 		json     signature over the raw request body; body carries `created` (ms)
 		upload   signature over `<content-hash>:<created>:<submission-id>`
 
-	The intake path (module.ts submit/finalize and the cache jobs) runs on this; the
-	worker still writes through db_archavon until it is converted.
+	The intake path (module.ts submit/finalize and the cache jobs) and the cache worker
+	both run on this; the worker ships its results as a delta (wdb_delta.ts).
  */
 
 import crypto from 'node:crypto';
