@@ -20,6 +20,9 @@ const WDB_DELTA_MAP: Record<string, DeltaAdd> = {
 const WDB_MAGIC_KEYS = new Set(Object.keys(WDB_DELTA_MAP));
 const XFTH_MAGIC = 0x48544658;
 
+// a game build changing a record layout shows up as a spike in per-record parse failures
+const PARSE_ERROR_ALERT_RATIO = 0.05;
+
 declare var self: Worker;
 
 function log(text: string) {
@@ -140,6 +143,22 @@ async function process_submission(submission_id: string) {
 					const stored = add_fn(delta, valid_records, file.locale, product, build_number);
 
 					log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, stored ${stored}, ${parse_errors} parse errors (${sig})`);
+
+					// dropped records are otherwise invisible; the submission still reports completed
+					if (parse_errors > 0 && parse_errors / result.records.length >= PARSE_ERROR_ALERT_RATIO) {
+						caution('cache: wdb parse errors above threshold', {
+							submission_id,
+							file_name: file.file_name,
+							locale: file.locale,
+							signature: sig,
+							product,
+							patch,
+							cache_build: result.header.build,
+							records: result.records.length,
+							parse_errors
+						});
+					}
+
 					delta.set_file_result(file.file_name, file.locale, 'completed', null, stored);
 					completed++;
 				} else if (file.file_name.toLowerCase() === 'dbcache.bin') {

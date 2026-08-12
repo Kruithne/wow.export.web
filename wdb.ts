@@ -835,7 +835,106 @@ function parse_quest_mop(buf: BufferReader, length: number, ver: GameVersion): Q
 	};
 }
 
+function read_quest_objectives(buf: BufferReader, count: number, ver: GameVersion): QuestObjective[] {
+	const objectives: QuestObjective[] = [];
+	for (let i = 0; i < count; i++) {
+		const id = buf.readUInt32LE();
+		const type = buf.readUInt32LE();
+		const storage_index = buf.readUInt8();
+		const object_id = buf.readUInt32LE();
+		const amount = buf.readUInt32LE();
+
+		if (ver_gte(ver, 11, 2, 7))
+			buf.readUInt32LE(); // ObjectiveUNK
+
+		const flags = buf.readUInt32LE();
+		const flags2 = buf.readUInt32LE();
+		const percent_amount = buf.readFloatLE();
+
+		const num_visual_effects = buf.readUInt32LE();
+		const visual_effects = buf.readUInt32Array(num_visual_effects);
+
+		if (ver_gte(ver, 11, 2, 7))
+			buf.readUInt32LE(); // WorldEffectID
+
+		const description_length = buf.readUInt8();
+
+		if (ver_gte(ver, 11, 2, 7) && ver.build >= 64228)
+			buf.readUInt8(); // padding
+
+		const description = description_length > 0 ? buf.readStringFixed(description_length).replace(/\0+$/, '') : '';
+
+		objectives.push({
+			id,
+			type,
+			storage_index,
+			object_id,
+			amount,
+			flags,
+			flags2,
+			percent_amount,
+			visual_effects,
+			description
+		});
+	}
+
+	return objectives;
+}
+
+function read_conditional_quest_texts(buf: BufferReader, count: number): ConditionalQuestText[] {
+	const texts: ConditionalQuestText[] = [];
+	for (let i = 0; i < count; i++) {
+		const player_condition_id = buf.readUInt32LE();
+		const quest_giver_creature_id = buf.readUInt32LE();
+
+		const ds = new BitReader(buf);
+		const text_len = ds.read_bits(12);
+		const text = ds.read_string(text_len).replace(/\0+$/, '');
+
+		texts.push({ player_condition_id, quest_giver_creature_id, text });
+	}
+
+	return texts;
+}
+
+// 12.1 moved the objective and conditional-text blocks ahead of the bitpacked string lengths.
+// cache files routinely lag the submitted patch, so the version gate only picks which ordering to
+// try first; exact record consumption decides, and the other ordering is used as a fallback.
 function parse_quest(buf: BufferReader, length: number, ver: GameVersion): QuestRecord {
+	const start = buf.offset;
+	const layouts = ver_gte(ver, 12, 1, 0) ? [true, false] : [false, true];
+
+	let candidate: QuestRecord | null = null;
+
+	for (const objectives_first of layouts) {
+		buf.seek(start);
+
+		try {
+			const record = parse_quest_body(buf, length, ver, objectives_first);
+			if (buf.offset !== start + length)
+				continue;
+
+			// a record can satisfy both orderings; an empty log title is the tell that the
+			// blocks were read in the wrong order
+			if (record.log_title !== '')
+				return record;
+
+			candidate ??= record;
+		} catch {
+			// layout mismatch, fall through and try the other ordering
+		}
+	}
+
+	if (candidate !== null) {
+		buf.seek(start + length);
+		return candidate;
+	}
+
+	buf.seek(start);
+	return parse_quest_body(buf, length, ver, layouts[0]);
+}
+
+function parse_quest_body(buf: BufferReader, length: number, ver: GameVersion, objectives_first: boolean): QuestRecord {
 	const quest_id = buf.readUInt32LE();
 	const quest_type = buf.readUInt32LE();
 	const quest_package_id = buf.readUInt32LE();
@@ -965,8 +1064,13 @@ function parse_quest(buf: BufferReader, length: number, ver: GameVersion): Quest
 		});
 	}
 
+	const early_objectives = objectives_first ? read_quest_objectives(buf, num_objectives, ver) : null;
+
 	const treasure_picker_ids = buf.readUInt32Array(treasure_picker_id_count);
 	const treasure_picker_ids_2 = buf.readUInt32Array(treasure_picker_id_2_count);
+
+	const early_conditional_descriptions = objectives_first ? read_conditional_quest_texts(buf, num_conditional_quest_description) : null;
+	const early_conditional_completions = objectives_first ? read_conditional_quest_texts(buf, num_conditional_quest_completion) : null;
 
 	// bitpacked string lengths
 	const ds = new BitReader(buf);
@@ -986,48 +1090,7 @@ function parse_quest(buf: BufferReader, length: number, ver: GameVersion): Quest
 
 	ds.flush();
 
-	// objectives
-	const objectives: QuestObjective[] = [];
-	for (let i = 0; i < num_objectives; i++) {
-		const obj_id = buf.readUInt32LE();
-		const obj_type = buf.readUInt32LE();
-		const storage_index = buf.readUInt8();
-		const object_id = buf.readUInt32LE();
-		const amount = buf.readUInt32LE();
-
-		if (ver_gte(ver, 11, 2, 7))
-			buf.readUInt32LE(); // ObjectiveUNK
-
-		const obj_flags = buf.readUInt32LE();
-		const obj_flags2 = buf.readUInt32LE();
-		const percent_amount = buf.readFloatLE();
-
-		const num_visual_effects = buf.readUInt32LE();
-		const visual_effects = buf.readUInt32Array(num_visual_effects);
-
-		if (ver_gte(ver, 11, 2, 7))
-			buf.readUInt32LE(); // WorldEffectID
-
-		const description_length = buf.readUInt8();
-
-		if (ver_gte(ver, 11, 2, 7) && ver.build >= 64228)
-			buf.readUInt8(); // padding
-
-		const description = ds.read_string(description_length).replace(/\0+$/, '');
-
-		objectives.push({
-			id: obj_id,
-			type: obj_type,
-			storage_index,
-			object_id,
-			amount,
-			flags: obj_flags,
-			flags2: obj_flags2,
-			percent_amount,
-			visual_effects,
-			description
-		});
-	}
+	const objectives = early_objectives ?? read_quest_objectives(buf, num_objectives, ver);
 
 	// trailing strings
 	const log_title = ds.read_string(log_title_len).replace(/\0+$/, '');
@@ -1041,26 +1104,8 @@ function parse_quest(buf: BufferReader, length: number, ver: GameVersion): Quest
 	const quest_completion_log = ds.read_string(quest_completion_log_len).replace(/\0+$/, '');
 	ds.flush();
 
-	// conditional descriptions
-	const conditional_quest_descriptions: ConditionalQuestText[] = [];
-	for (let i = 0; i < num_conditional_quest_description; i++) {
-		const player_condition_id = buf.readUInt32LE();
-		const cond_quest_giver_creature_id = buf.readUInt32LE();
-		const cond_len = ds.read_bits(12);
-		ds.flush();
-		const text = ds.read_string(cond_len).replace(/\0+$/, '');
-		conditional_quest_descriptions.push({ player_condition_id, quest_giver_creature_id: cond_quest_giver_creature_id, text });
-	}
-
-	const conditional_quest_completions: ConditionalQuestText[] = [];
-	for (let i = 0; i < num_conditional_quest_completion; i++) {
-		const player_condition_id = buf.readUInt32LE();
-		const cond_quest_giver_creature_id = buf.readUInt32LE();
-		const cond_len = ds.read_bits(12);
-		ds.flush();
-		const text = ds.read_string(cond_len).replace(/\0+$/, '');
-		conditional_quest_completions.push({ player_condition_id, quest_giver_creature_id: cond_quest_giver_creature_id, text });
-	}
+	const conditional_quest_descriptions = early_conditional_descriptions ?? read_conditional_quest_texts(buf, num_conditional_quest_description);
+	const conditional_quest_completions = early_conditional_completions ?? read_conditional_quest_texts(buf, num_conditional_quest_completion);
 
 	return {
 		quest_id, quest_type, quest_package_id, content_tuning_id,
