@@ -6,10 +6,12 @@
 
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { caution } from 'spooder';
+import { caution, log_create_logger } from 'spooder';
 
 const CDN_URL = 'https://cdn.rubberducksolutions.dev';
 const PRESIGN_EXPIRY_DEFAULT = 24 * 60 * 60 * 1000; // 24 hours
+
+const log = log_create_logger('obj_rds', '#7aa2f7ff');
 
 let HMAC_ALG = 'sha256';
 
@@ -96,6 +98,12 @@ export function bucket(bucket_id: string, bucket_secret: string) {
 				body: payload_str
 			});
 
+			// deleting an object that is already gone is idempotently benign
+			if (action === 'delete' && res.status === 404) {
+				log(`delete {${(params as any).object_id}} in {${bucket_id}}: already absent`);
+				return res;
+			}
+
 			if (!res.ok) {
 				caution('obj_rds: bucket action failed', {
 					status_text: await res.text(),
@@ -159,12 +167,14 @@ export function bucket(bucket_id: string, bucket_secret: string) {
 		 *
 		 * Only finalized objects can be deleted.
 		 *
+		 * A 404 is treated as success; the object is already gone.
+		 *
 		 * Returns true if successful, false otherwise.
 		 */
 		delete: async function (object_id: string): Promise<boolean> {
 			const res = await this.action('delete', { object_id });
 			await res.body?.cancel();
-			return res.ok;
+			return res.ok || res.status === 404;
 		},
 
 		/**

@@ -689,6 +689,11 @@ async function cache_cleanup_stale() {
 // a failed submission keeps its uploaded objects on the CDN forever unless
 // something releases them; this leaked ~82GB across 74.6k objects before the
 // worker connection exhaustion was fixed
+//
+// delete-before-mark is deliberate here and in the other release paths. a failed
+// mark leaves the row pending, so the set is re-listed and re-deleted, and a
+// delete of an absent object is a no-op. marking first would strand the object
+// outside the reapable set (pending + failed only) with nothing left to find it.
 async function cache_reap_failed() {
 	try {
 		const reapable = await archavon.list_reapable_files(CACHE_REAP_AGE, CACHE_REAP_BATCH);
