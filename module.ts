@@ -420,7 +420,8 @@ const archavon = archavon_api();
 // restart (an unhandled worker error aborts the whole process) cannot reset it
 const CACHE_MAX_ATTEMPTS = 3;
 const CACHE_RETRY_BACKOFF = 30000;
-const CACHE_ATTEMPT_PATTERN = /^worker attempt (\d+)\/\d+$/;
+// suffix allowed: a timed-out delta apply appends its outcome to the claim reason
+const CACHE_ATTEMPT_PATTERN = /^worker attempt (\d+)\/\d+/;
 const CACHE_TERMINAL_STATUS = new Set(['completed', 'partial', 'failed']);
 
 // unfinalized submissions older than this are abandoned uploads
@@ -455,6 +456,10 @@ async function cache_fail_submission(submission_id: string, reason: string) {
 	}
 }
 
+function cache_attempt_label(attempt: number): string {
+	return `worker attempt ${attempt}/${CACHE_MAX_ATTEMPTS}`;
+}
+
 // reads the attempt ledger from archavon and records this run in it; returns
 // the attempt number, or null when the submission must not be run
 async function cache_claim_submission(submission_id: string): Promise<number | null> {
@@ -487,7 +492,7 @@ async function cache_claim_submission(submission_id: string): Promise<number | n
 		return null;
 	}
 
-	await archavon.update_submission_status({ submission_id, status: 'processing', status_reason: `worker attempt ${attempt}/${CACHE_MAX_ATTEMPTS}` });
+	await archavon.update_submission_status({ submission_id, status: 'processing', status_reason: cache_attempt_label(attempt) });
 	return attempt;
 }
 
@@ -596,7 +601,7 @@ async function process_cache_queue() {
 			cache_worker_submission = submission_id;
 			cache_worker_attempt = attempt;
 			cache_worker = spawn_cache_worker();
-			cache_worker.postMessage({ submission_id });
+			cache_worker.postMessage({ submission_id, attempt_label: cache_attempt_label(attempt) });
 		}
 	} finally {
 		cache_queue_draining = false;

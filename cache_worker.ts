@@ -2,7 +2,7 @@ import { caution } from 'spooder';
 import { bucket } from './obj_rds';
 import { parse_wdb, type WdbRecord } from './wdb';
 import { parse_dbcache } from './dbcache';
-import { archavon_api, type FailureReason, type SettableSubmissionStatus, type SubmissionFile } from './archavon_api';
+import { archavon_api, delta_timeout_ms, is_timeout_error, type FailureReason, type SettableSubmissionStatus, type SubmissionFile } from './archavon_api';
 import { WdbDelta } from './wdb_delta';
 
 const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
@@ -35,10 +35,10 @@ self.onmessage = async (event: MessageEvent) => {
 		return;
 	}
 
-	const { submission_id } = event.data;
+	const { submission_id, attempt_label } = event.data;
 
 	try {
-		await process_submission(submission_id);
+		await process_submission(submission_id, attempt_label);
 	} catch (e) {
 		// an unhandled throw here aborts the whole bun process (exit 134) and
 		// self.close() does not exist in bun workers; the main thread owns the
@@ -74,6 +74,19 @@ function rollup_status(files: SubmissionFile[]): { status: SettableSubmissionSta
 	return { status: completed === 0 ? 'failed' : 'partial', status_reason };
 }
 
+// the apply endpoint writes every file row in the same commit as the ledger
+// entry, so terminal file rows mean an earlier apply of this submission landed
+// even when the roll-up was since reset to 'processing' by a claim
+function delta_landed(files: SubmissionFile[]): boolean {
+	return files.length > 0 && files.every(f => f.status !== 'pending');
+}
+
+async function restore_rollup(submission_id: string, files: SubmissionFile[], why: string) {
+	const rollup = rollup_status(files);
+	await archavon.update_submission_status({ submission_id, ...rollup });
+	log(`submission {${submission_id}} ${why}, status reset to ${rollup.status}`);
+}
+
 // drops the cdn object and records the file as rejected in the delta
 async function reject_file(delta: WdbDelta, file: SubmissionFile, reason: FailureReason) {
 	try {
@@ -85,16 +98,43 @@ async function reject_file(delta: WdbDelta, file: SubmissionFile, reason: Failur
 	delta.set_file_result(file.file_name, file.locale, 'rejected', reason, 0);
 }
 
-async function process_submission(submission_id: string) {
-	const submission = await archavon.get_submission(submission_id).catch(e => {
+async function fetch_submission(submission_id: string) {
+	return await archavon.get_submission(submission_id).catch(e => {
 		if (e?.status === 404)
 			return null;
 
 		throw e;
 	});
+}
+
+// the server keeps applying after the client aborts, so the row is left in
+// 'processing' for the backlog drain rather than resent; the next attempt
+// re-reads the file rows and only uploads when nothing landed
+async function record_delta_timeout(submission_id: string, attempt_label: string, elapsed_ms: number) {
+	const elapsed_s = Math.round(elapsed_ms / 1000);
+	const submission = await fetch_submission(submission_id);
+
+	if (submission === null)
+		return;
+
+	if (delta_landed(submission.files)) {
+		await restore_rollup(submission_id, submission.files, `delta landed after the ${elapsed_s}s client timeout`);
+		return;
+	}
+
+	await archavon.update_submission_status({ submission_id, status: 'processing', status_reason: `${attempt_label}: delta apply timed out after ${elapsed_s}s` });
+}
+
+async function process_submission(submission_id: string, attempt_label: string) {
+	const submission = await fetch_submission(submission_id);
 
 	if (submission === null) {
 		log(`submission {${submission_id}} not found, skipping`);
+		return;
+	}
+
+	if (delta_landed(submission.files)) {
+		await restore_rollup(submission_id, submission.files, 'delta already applied by an earlier attempt');
 		return;
 	}
 
@@ -109,6 +149,8 @@ async function process_submission(submission_id: string) {
 	try {
 		let completed = 0;
 		let rejected = 0;
+		let entity_rows = 0;
+		let hotfix_rows = 0;
 
 		for (const file of submission.files) {
 			try {
@@ -163,6 +205,7 @@ async function process_submission(submission_id: string) {
 					const valid_records = result.records.filter(r => !('parse_error' in r.data));
 					const parse_errors = result.records.length - valid_records.length;
 					const stored = add_fn(delta, valid_records, file.locale, product, build_number);
+					entity_rows += stored;
 
 					log(`wdb {${file.locale}/${file.file_name}}: ${result.records.length} records, stored ${stored}, ${parse_errors} parse errors (${sig})`);
 
@@ -204,6 +247,7 @@ async function process_submission(submission_id: string) {
 					log(`dbcache {${file.locale}/${file.file_name}}: ${result.entries.length} entries, build=${result.header.build}, version=${result.header.version}`);
 
 					const inserted = delta.add_hotfixes(result.entries, product, build_number);
+					hotfix_rows += inserted;
 
 					log(`dbcache {${file.locale}/${file.file_name}}: stored {${inserted}} hotfix entries`);
 					delta.set_file_result(file.file_name, file.locale, 'completed', null, inserted);
@@ -217,22 +261,43 @@ async function process_submission(submission_id: string) {
 		}
 
 		const payload = delta.serialize();
-		log(`submission {${submission_id}} delta built: ${payload.byteLength} bytes, ${completed} completed, ${rejected} rejected`);
+		const timeout_ms = delta_timeout_ms(payload.byteLength);
+		log(`submission {${submission_id}} delta built: ${payload.byteLength} bytes, ${entity_rows} entity rows, ${hotfix_rows} hotfixes, ${completed} completed, ${rejected} rejected, apply timeout ${Math.round(timeout_ms / 1000)}s`);
+
+		// an apply that was in flight when this attempt was claimed may have landed since
+		const current = await fetch_submission(submission_id);
+		if (current !== null && delta_landed(current.files)) {
+			await restore_rollup(submission_id, current.files, 'delta landed while this attempt was building');
+			return;
+		}
 
 		// no terminal status call; the apply endpoint owns the per-file writes and the
 		// roll-up, and a failed dispatch throws into the retry path
-		const result = await archavon.upload_delta(submission_id, payload);
+		const started = Date.now();
+		let result;
+
+		try {
+			result = await archavon.upload_delta(submission_id, payload);
+		} catch (e) {
+			if (!is_timeout_error(e))
+				throw e;
+
+			const elapsed_ms = Date.now() - started;
+			caution('cache: delta apply timed out', { submission_id, attempt_label, bytes: payload.byteLength, entity_rows, hotfix_rows, timeout_ms, elapsed_ms });
+			await record_delta_timeout(submission_id, attempt_label, elapsed_ms);
+			return;
+		}
+
+		const elapsed_s = ((Date.now() - started) / 1000).toFixed(1);
 
 		// a re-run of an applied delta finds the roll-up reset to 'processing' by the
 		// claim; the file rows are authoritative, so rebuild the roll-up from them
 		if (result.already_applied) {
-			const rollup = rollup_status(submission.files);
-			await archavon.update_submission_status({ submission_id, ...rollup });
-			log(`submission {${submission_id}} delta already applied at ${result.applied_at}, status reset to ${rollup.status}`);
+			await restore_rollup(submission_id, submission.files, `delta already applied at ${result.applied_at}`);
 			return;
 		}
 
-		log(`submission {${submission_id}} done: ${result.files_updated} files updated, ${result.attestations} attestations, ${result.hotfixes} hotfixes, consensus +${result.consensus.promoted}/-${result.consensus.demoted} [${result.status}]`);
+		log(`submission {${submission_id}} done in ${elapsed_s}s: ${result.files_updated} files updated, ${result.attestations} attestations, ${result.hotfixes} hotfixes, consensus +${result.consensus.promoted}/-${result.consensus.demoted} [${result.status}]`);
 	} finally {
 		delta.close();
 	}

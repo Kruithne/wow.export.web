@@ -13,7 +13,13 @@ const DEFAULT_RETRY_COUNT = 3;
 const DEFAULT_RETRY_DELAY_MS = 250;
 const DEFAULT_RETRY_DELAY_MAX_MS = 4000;
 const DEFAULT_TIMEOUT_MS = 30000;
-const DELTA_TIMEOUT_MS = 120000;
+
+// the apply runs on the shared host inside one write transaction and scales with
+// delta size (an 11MB hotfix delta ran past 6 minutes), so a single long wait
+// beats repeats: the server keeps applying after a client abort
+const DELTA_TIMEOUT_BASE_MS = 120000;
+const DELTA_TIMEOUT_PER_MB_MS = 60000;
+const DELTA_TIMEOUT_MAX_MS = 900000;
 
 const RETRY_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
@@ -291,6 +297,15 @@ export function hash_body(data: Uint8Array): string {
 	return new Bun.CryptoHasher('sha256').update(data).digest('hex');
 }
 
+export function delta_timeout_ms(byte_length: number): number {
+	return Math.min(DELTA_TIMEOUT_BASE_MS + Math.ceil(byte_length / (1024 * 1024)) * DELTA_TIMEOUT_PER_MB_MS, DELTA_TIMEOUT_MAX_MS);
+}
+
+// AbortSignal.timeout rejects with a DOMException, not an ArchavonApiError
+export function is_timeout_error(error: unknown): boolean {
+	return (error as { name?: string } | null)?.name === 'TimeoutError';
+}
+
 function delay(ms: number): Promise<void> {
 	return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -495,9 +510,11 @@ export function archavon_api(options: ClientOptions = {}) {
 			return post_json<PurgeObjectsResult>('intake/cleanup/purged', { object_ids });
 		},
 
-		// idempotent server-side via the delta_applications ledger, so retries are safe.
-		// multipart, not a raw body: the shared host's proxy truncates raw bodies over
-		// ~2.5MB while multipart arrives intact
+		// single-shot: the delta_applications ledger only dedups after a committed apply,
+		// and the server keeps applying after a client abort, so a resend queues a second
+		// full apply behind the same write lock. the caller decides whether to resend
+		// after checking the submission's file rows. multipart, not a raw body: the
+		// shared host's proxy truncates raw bodies over ~2.5MB while multipart arrives intact
 		upload_delta: async (submission_id: string, data: Uint8Array, opts: RequestOptions = {}): Promise<DeltaResult> => {
 			const content_hash = hash_body(data);
 
@@ -515,7 +532,7 @@ export function archavon_api(options: ClientOptions = {}) {
 						'X-Signature': sign_upload(content_hash, created, submission_id, secret)
 					}
 				};
-			}, { timeout_ms: DELTA_TIMEOUT_MS, ...opts });
+			}, { retry_count: 0, timeout_ms: delta_timeout_ms(data.byteLength), ...opts });
 
 			return await res.json() as DeltaResult;
 		}
