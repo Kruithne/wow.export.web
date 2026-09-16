@@ -25,8 +25,14 @@ function is_classic(ver: GameVersion): boolean {
 	return ver.product === 'wow_classic_era' || ver.product === 'wow_anniversary' || ver.product === 'wow_classic';
 }
 
+// wow_classic covers every progression classic product; archavon holds 3.4.x (wrath) and 5.5.x
+// (mop) submissions, and patch 0.0.0 falls through to the current mop layout
 function is_mop_classic(ver: GameVersion): boolean {
-	return ver.product === 'wow_classic';
+	return ver.product === 'wow_classic' && !is_wrath_classic(ver);
+}
+
+function is_wrath_classic(ver: GameVersion): boolean {
+	return ver.product === 'wow_classic' && ver.expansion === 3;
 }
 
 function is_anniversary(ver: GameVersion): boolean {
@@ -497,7 +503,12 @@ function parse_quest_classic_items(buf: BufferReader, flags_count: number): {
 	return { flags, reward_fixed_items, item_drop_items, reward_choice_items };
 }
 
+// wrath classic (wow_classic 3.4.x) is the classic era layout with one unknown u32 after the
+// portrait display ids, 5 trailing u32s (second is expansion_id) and a u8 objective type.
+// verified by exact record consumption on 5868 records across 9 build 54261 caches.
 function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVersion): QuestRecord {
+	const start = buf.offset;
+	const wrath = is_wrath_classic(ver);
 	const h = parse_quest_classic_common_header(buf);
 	const items = parse_quest_classic_items(buf, 3);
 
@@ -514,7 +525,8 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 	const portrait_turn_in_display_id = buf.readUInt32LE();
 
 	buf.readUInt32LE(); // unknown
-	buf.readUInt32LE(); // unknown
+	if (!wrath)
+		buf.readUInt32LE(); // unknown
 
 	const faction_rewards: QuestFactionReward[] = [];
 	for (let i = 0; i < 5; i++) {
@@ -543,9 +555,12 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 	const num_objectives = buf.readUInt32LE();
 	const race_flags = buf.readUInt64LE();
 
-	const extra_count = is_anniversary(ver) ? 8 : 6;
+	const extra_count = is_anniversary(ver) ? 8 : wrath ? 5 : 6;
+	const extras: number[] = [];
 	for (let i = 0; i < extra_count; i++)
-		buf.readUInt32LE();
+		extras.push(buf.readUInt32LE());
+
+	const expansion_id = wrath ? extras[1] : 0;
 
 	const ds = new BitReader(buf);
 
@@ -564,7 +579,7 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 	const objectives: QuestObjective[] = [];
 	for (let i = 0; i < num_objectives; i++) {
 		const obj_id = buf.readUInt32LE();
-		const obj_type = buf.readUInt32LE();
+		const obj_type = wrath ? buf.readUInt8() : buf.readUInt32LE();
 		const storage_index = buf.readUInt8();
 		const object_id = buf.readInt32LE();
 		const amount = buf.readInt32LE();
@@ -613,6 +628,9 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 	const quest_completion_log = ds.read_string(quest_completion_log_len).replace(/\0+$/, '');
 	ds.flush();
 
+	if (wrath && buf.offset !== start + length)
+		throw new Error(`wrath quest record consumed ${buf.offset - start} of ${length} bytes`);
+
 	const reward_display_spells: QuestRewardDisplaySpell[] = [];
 	for (const spell_id of h.reward_display_spells_fixed) {
 		if (spell_id !== 0)
@@ -646,7 +664,7 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 		faction_rewards, reward_faction_flags, currency_rewards,
 		accepted_sound_kit_id, complete_sound_kit_id, area_group_id,
 		time_allowed, num_objectives, race_flags,
-		expansion_id: 0, managed_world_state_id: 0, quest_session_bonus: 0,
+		expansion_id, managed_world_state_id: 0, quest_session_bonus: 0,
 		quest_giver_creature_id: 0,
 		reward_display_spells,
 		treasure_picker_ids: [], treasure_picker_ids_2: [],
