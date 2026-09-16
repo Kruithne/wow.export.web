@@ -1,6 +1,6 @@
 import { caution } from 'spooder';
 import { bucket } from './obj_rds';
-import { parse_wdb, type WdbRecord } from './wdb';
+import { parse_wdb, classify_product, type WdbRecord } from './wdb';
 import { parse_dbcache } from './dbcache';
 import { archavon_api, delta_timeout_ms, is_timeout_error, type FailureReason, type SettableSubmissionStatus, type SubmissionFile } from './archavon_api';
 import { WdbDelta } from './wdb_delta';
@@ -142,6 +142,11 @@ async function process_submission(submission_id: string, attempt_label: string) 
 
 	log(`submission {${submission_id}} ${product} ${patch}.${build_number} (machine: ${machine_id})`);
 
+	// unknown families would otherwise be parsed with the retail layout and flood the parse error canary
+	const product_known = classify_product(product) !== null;
+	if (!product_known)
+		log(`submission {${submission_id}}: unknown product family "${product}", rejecting wdb files`);
+
 	await archavon.check_machine(machine_id);
 
 	const delta = new WdbDelta(submission_id, machine_id);
@@ -180,6 +185,12 @@ async function process_submission(submission_id: string, attempt_label: string) 
 					if (!WDB_MAGIC_KEYS.has(wdb_sig)) {
 						log(`wdb {${file.locale}/${file.file_name}}: invalid magic "${wdb_sig}", rejecting`);
 						await reject_file(delta, file, 'invalid_magic');
+						rejected++;
+						continue;
+					}
+
+					if (!product_known) {
+						await reject_file(delta, file, 'parse_error');
 						rejected++;
 						continue;
 					}

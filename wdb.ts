@@ -2,41 +2,96 @@ import BufferReader from './buffer';
 
 const WDB_HEADER_SIZE = 24;
 
+const PRODUCT_SUFFIX_PATTERN = /_(ptr|beta|alpha|test)$/;
+const RETAIL_PRODUCTS = new Set(['wow', 'wowt', 'wowxptr']);
+const CLASSIC_PRODUCTS = new Set(['wow_classic', 'wow_classic_era', 'wow_anniversary', 'wow_classic_titan']);
+
+// first cache build per classic product on the shared quest record (parse_quest_classic); earlier
+// builds use the per-product legacy layouts. verified by exact record consumption on archavon
+// submissions either side of each cutoff (era 67156/68808, anniversary 68101/68184 ptr, titan 68805/68943)
+const CLASSIC_SHARED_QUEST_BUILD: Record<string, number> = {
+	wow_classic_era: 68808,
+	wow_anniversary: 68184,
+	wow_classic_titan: 68943
+};
+
+// first classic cache build on the modern-engine record layouts (creature body, era quest); the
+// 3.4.3 (54261) and 1.14.2 (42597) caches use the legacy creature body and wrath/vanilla quests
+const CLASSIC_MODERN_ENGINE_BUILD = 62824;
+
+// classic gameobject trailing u32 absent on 3.4.x (<= 62824) and 1.14.x, present from 67156
+const CLASSIC_GOB_TRAILING_BUILD = 67156;
+
+type ProductFamily = 'retail' | 'classic';
+type ClassicQuestLayout = 'era' | 'anniversary' | 'wrath' | 'vanilla';
+
 interface GameVersion {
 	expansion: number;
 	major: number;
 	minor: number;
 	build: number;
 	product: string;
+	family: ProductFamily;
 }
 
-function parse_game_version(patch: string, build: number, product: string): GameVersion {
+interface ProductInfo {
+	product: string;
+	family: ProductFamily;
+}
+
+// strips ptr/beta suffixes and maps onto a known family; null for products with no known layout
+export function classify_product(product: string): ProductInfo | null {
+	const base = product.replace(PRODUCT_SUFFIX_PATTERN, '');
+	if (RETAIL_PRODUCTS.has(base))
+		return { product: base, family: 'retail' };
+
+	if (CLASSIC_PRODUCTS.has(base))
+		return { product: base, family: 'classic' };
+
+	return null;
+}
+
+function parse_game_version(patch: string, build: number, info: ProductInfo): GameVersion {
 	const parts = patch.split('.').map(Number);
 	return {
 		expansion: parts[0] ?? 0,
 		major: parts[1] ?? 0,
 		minor: parts[2] ?? 0,
 		build,
-		product
+		product: info.product,
+		family: info.family
 	};
 }
 
 function is_classic(ver: GameVersion): boolean {
-	return ver.product === 'wow_classic_era' || ver.product === 'wow_anniversary' || ver.product === 'wow_classic';
+	return ver.family === 'classic';
 }
 
 // wow_classic covers every progression classic product; archavon holds 3.4.x (wrath) and 5.5.x
-// (mop) submissions, and patch 0.0.0 falls through to the current mop layout
-function is_mop_classic(ver: GameVersion): boolean {
-	return ver.product === 'wow_classic' && !is_wrath_classic(ver);
-}
-
+// (mop) submissions, and patch 0.0.0 falls through to the current shared layout
 function is_wrath_classic(ver: GameVersion): boolean {
 	return ver.product === 'wow_classic' && ver.expansion === 3;
 }
 
-function is_anniversary(ver: GameVersion): boolean {
-	return ver.product === 'wow_anniversary';
+function classic_quest_layout(ver: GameVersion): ClassicQuestLayout | null {
+	const legacy_engine = ver.build < CLASSIC_MODERN_ENGINE_BUILD;
+
+	if (ver.product === 'wow_classic') {
+		if (!is_wrath_classic(ver))
+			return null;
+
+		return legacy_engine ? 'wrath' : 'era';
+	}
+
+	// the era ptr slot hosts the anniversary (2.5.x) client ahead of live
+	const line = ver.product === 'wow_classic_era' && ver.expansion >= 2 ? 'wow_anniversary' : ver.product;
+	if (ver.build >= CLASSIC_SHARED_QUEST_BUILD[line]!)
+		return null;
+
+	if (line === 'wow_classic_era')
+		return legacy_engine ? 'vanilla' : 'era';
+
+	return 'anniversary';
 }
 
 function ver_gte(ver: GameVersion, exp: number, maj: number, min: number): boolean {
@@ -316,21 +371,32 @@ function parse_creature(buf: BufferReader, length: number, ver: GameVersion): Cr
 	const title_len = ds.read_bits(11);
 	const title_alt_len = ds.read_bits(11);
 	const cursor_name_len = ds.read_bits(6);
+
+	// classic packs an extra bool ahead of leader; only faction leaders set the second bit.
+	// verified by exact record consumption across era/anniversary/mop/titan caches
+	const classic = is_classic(ver);
+	if (classic)
+		ds.read_bool(); // unk
+
 	const leader = ds.read_bool();
 
-	const classic = is_classic(ver);
 	const name_lens: number[] = [];
 	const name_alt_lens: number[] = [];
 	for (let i = 0; i < 4; i++) {
-		name_lens.push(ds.read_bits(classic ? 12 : 11));
-		name_alt_lens.push(ds.read_bits(classic ? 10 : 11));
+		name_lens.push(ds.read_bits(11));
+		name_alt_lens.push(ds.read_bits(11));
 	}
+
+	// legacy-engine classic (3.4.3, 1.14.2) writes length 1 for absent strings without a byte, and
+	// carries the pre-11.2 retail body (u32 type/family/classification, no currency count)
+	const legacy = classic && ver.build < CLASSIC_MODERN_ENGINE_BUILD;
+	const read_string = (len: number): string => legacy && len === 1 ? '' : ds.read_string(len).replace(/\0+$/, '');
 
 	const names: string[] = [];
 	const name_alts: string[] = [];
 	for (let i = 0; i < 4; i++) {
-		names.push(ds.read_string(name_lens[i]!).replace(/\0+$/, ''));
-		name_alts.push(ds.read_string(name_alt_lens[i]!).replace(/\0+$/, ''));
+		names.push(read_string(name_lens[i]!));
+		name_alts.push(read_string(name_alt_lens[i]!));
 	}
 
 	const flags_0 = buf.readUInt32LE();
@@ -341,7 +407,11 @@ function parse_creature(buf: BufferReader, length: number, ver: GameVersion): Cr
 	let creature_family: number;
 	let classification: number;
 
-	if (classic) {
+	if (legacy) {
+		creature_type = buf.readUInt32LE();
+		creature_family = buf.readUInt32LE();
+		classification = buf.readUInt32LE();
+	} else if (classic) {
 		buf.readUInt32LE(); // unk
 		creature_type = buf.readUInt8();
 		creature_family = buf.readUInt8();
@@ -379,7 +449,7 @@ function parse_creature(buf: BufferReader, length: number, ver: GameVersion): Cr
 	const energy_multiplier = buf.readFloatLE();
 
 	const num_quest_items = buf.readUInt32LE();
-	const num_currency_ids = buf.readUInt32LE();
+	const num_currency_ids = legacy ? 0 : buf.readUInt32LE();
 
 	const movement_info_id = buf.readInt32LE();
 	const required_expansion = buf.readUInt32LE();
@@ -390,9 +460,9 @@ function parse_creature(buf: BufferReader, length: number, ver: GameVersion): Cr
 	const widget_parent_set_id = buf.readUInt32LE();
 	const widget_set_unit_condition_id = buf.readUInt32LE();
 
-	const title = ds.read_string(title_len).replace(/\0+$/, '');
-	const title_alt = ds.read_string(title_alt_len).replace(/\0+$/, '');
-	const cursor_name = cursor_name_len !== 1 ? ds.read_string(cursor_name_len).replace(/\0+$/, '') : '';
+	const title = read_string(title_len);
+	const title_alt = read_string(title_alt_len);
+	const cursor_name = cursor_name_len !== 1 ? read_string(cursor_name_len) : '';
 
 	const quest_items = buf.readUInt32Array(num_quest_items);
 	const currency_ids = buf.readUInt32Array(num_currency_ids);
@@ -503,12 +573,17 @@ function parse_quest_classic_items(buf: BufferReader, flags_count: number): {
 	return { flags, reward_fixed_items, item_drop_items, reward_choice_items };
 }
 
-// wrath classic (wow_classic 3.4.x) is the classic era layout with one unknown u32 after the
-// portrait display ids, 5 trailing u32s (second is expansion_id) and a u8 objective type.
-// verified by exact record consumption on 5868 records across 9 build 54261 caches.
-function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVersion): QuestRecord {
+// legacy per-product classic quest layouts, superseded by parse_quest_classic (see
+// CLASSIC_SHARED_QUEST_BUILD). wrath (wow_classic 3.4.3) is the era layout with one unknown u32
+// after the portrait display ids, 5 trailing u32s (second is expansion_id) and a u8 objective
+// type; verified by exact record consumption on 5868 records across 9 build 54261 caches.
+// vanilla (wow_classic_era 1.14.2) is wrath with a u32 time_allowed and 2 trailing u32s
+function parse_quest_classic_legacy(buf: BufferReader, length: number, layout: ClassicQuestLayout): QuestRecord {
 	const start = buf.offset;
-	const wrath = is_wrath_classic(ver);
+	const wrath = layout === 'wrath';
+	const vanilla = layout === 'vanilla';
+	const legacy_engine = wrath || vanilla;
+	const anniversary = layout === 'anniversary';
 	const h = parse_quest_classic_common_header(buf);
 	const items = parse_quest_classic_items(buf, 3);
 
@@ -525,7 +600,7 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 	const portrait_turn_in_display_id = buf.readUInt32LE();
 
 	buf.readUInt32LE(); // unknown
-	if (!wrath)
+	if (!legacy_engine)
 		buf.readUInt32LE(); // unknown
 
 	const faction_rewards: QuestFactionReward[] = [];
@@ -551,11 +626,11 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 	const accepted_sound_kit_id = buf.readUInt32LE();
 	const complete_sound_kit_id = buf.readUInt32LE();
 	const area_group_id = buf.readUInt32LE();
-	const time_allowed = buf.readUInt64LE();
+	const time_allowed = vanilla ? BigInt(buf.readUInt32LE()) : buf.readUInt64LE();
 	const num_objectives = buf.readUInt32LE();
 	const race_flags = buf.readUInt64LE();
 
-	const extra_count = is_anniversary(ver) ? 8 : wrath ? 5 : 6;
+	const extra_count = anniversary ? 8 : wrath ? 5 : vanilla ? 2 : 6;
 	const extras: number[] = [];
 	for (let i = 0; i < extra_count; i++)
 		extras.push(buf.readUInt32LE());
@@ -579,7 +654,7 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 	const objectives: QuestObjective[] = [];
 	for (let i = 0; i < num_objectives; i++) {
 		const obj_id = buf.readUInt32LE();
-		const obj_type = wrath ? buf.readUInt8() : buf.readUInt32LE();
+		const obj_type = legacy_engine ? buf.readUInt8() : buf.readUInt32LE();
 		const storage_index = buf.readUInt8();
 		const object_id = buf.readInt32LE();
 		const amount = buf.readInt32LE();
@@ -590,7 +665,7 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 		const num_visual_effects = buf.readUInt32LE();
 		const visual_effects = buf.readUInt32Array(num_visual_effects);
 
-		if (is_anniversary(ver)) {
+		if (anniversary) {
 			buf.readUInt32LE(); // extra_u32_1
 			buf.readUInt32LE(); // extra_u32_2
 		}
@@ -598,7 +673,7 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 		const description_length = ds.read_bits(8);
 		const description = ds.read_string(description_length).replace(/\0+$/, '');
 
-		if (is_anniversary(ver)) {
+		if (anniversary) {
 			ds.read_bool(); // extra_bool
 			ds.flush();
 		}
@@ -628,8 +703,8 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 	const quest_completion_log = ds.read_string(quest_completion_log_len).replace(/\0+$/, '');
 	ds.flush();
 
-	if (wrath && buf.offset !== start + length)
-		throw new Error(`wrath quest record consumed ${buf.offset - start} of ${length} bytes`);
+	if (legacy_engine && buf.offset !== start + length)
+		throw new Error(`${layout} quest record consumed ${buf.offset - start} of ${length} bytes`);
 
 	const reward_display_spells: QuestRewardDisplaySpell[] = [];
 	for (const spell_id of h.reward_display_spells_fixed) {
@@ -678,10 +753,10 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 	};
 }
 
-// mop classic (wow_classic 5.5.x) runs on the modern engine, so the record is the retail 12.0 quest
-// response with the classic header (level fields, 3 fixed display spells, 4 flags words). verified by
-// exact record consumption on 6282 records across cache builds 68016-69383; every build uses this
-// layout, the previous mop layout matched no record at all.
+// shared classic quest record: every classic product now runs on the modern engine, so the record is
+// the retail 12.0 quest response with the classic header (level fields, 3 fixed display spells, 4 flags
+// words). verified by exact record consumption on 6282 mop records across cache builds 68016-69383
+// and on era (>= 68808), anniversary (>= 68184) and titan (>= 68943) caches.
 //
 // differences from the retail parser:
 // - reward_favor u32 follows reward_honor_multiplier
@@ -691,7 +766,7 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 // - objective: unk u32 before flags, u32 (always 0) between the visual effect count and the array,
 //   description length is 8 bits + 1 bit (always set) + flush
 // - conditional texts trail the strings
-function parse_quest_mop(buf: BufferReader, length: number, ver: GameVersion): QuestRecord {
+function parse_quest_classic(buf: BufferReader, length: number, _ver: GameVersion): QuestRecord {
 	const start = buf.offset;
 	const h = parse_quest_classic_common_header(buf, true);
 	const items = parse_quest_classic_items(buf, 4);
@@ -1193,7 +1268,7 @@ function parse_gameobject(buf: BufferReader, length: number, ver: GameVersion): 
 	const quest_items = buf.readUInt32Array(num_quest_items);
 	const content_tuning_id = buf.readUInt32LE();
 
-	if (is_classic(ver) || ver_gte(ver, 11, 2, 0))
+	if (is_classic(ver) ? ver.build >= CLASSIC_GOB_TRAILING_BUILD : ver_gte(ver, 11, 2, 0))
 		buf.readUInt32LE(); // trailing u32
 
 	return { type, display_id, names, icon, action, condition, game_data, scale, quest_items, content_tuning_id };
@@ -1217,11 +1292,14 @@ function parse_fallback(_buf: BufferReader, length: number, _ver: GameVersion): 
 }
 
 function select_quest_parser(ver: GameVersion): BodyParser {
-	if (is_mop_classic(ver))
-		return parse_quest_mop;
-	if (is_classic(ver))
-		return parse_quest_classic_era;
-	return parse_quest;
+	if (!is_classic(ver))
+		return parse_quest;
+
+	const layout = classic_quest_layout(ver);
+	if (layout === null)
+		return parse_quest_classic;
+
+	return (buf, length) => parse_quest_classic_legacy(buf, length, layout);
 }
 
 const BODY_PARSERS: Record<string, BodyParser> = {
@@ -1235,9 +1313,13 @@ export function parse_wdb(data: ArrayBuffer, patch: string, product: string = 'w
 	if (data.byteLength < WDB_HEADER_SIZE)
 		return null;
 
+	const info = classify_product(product);
+	if (info === null)
+		return null;
+
 	const buf = new BufferReader(data);
 	const header = read_header(buf);
-	const ver = parse_game_version(patch, header.build, product);
+	const ver = parse_game_version(patch, header.build, info);
 
 	let body_parser = BODY_PARSERS[header.signature] ?? parse_fallback;
 	if (header.signature === 'WQST')

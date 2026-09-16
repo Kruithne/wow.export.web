@@ -1,4 +1,4 @@
-import { parse_wdb } from './wdb';
+import { parse_wdb, classify_product } from './wdb';
 
 // pulls completed submissions from the public archavon read api, parses their wdb files with the
 // current parser and reports the per-file and aggregate parse error ratio. exits 1 if the aggregate
@@ -23,6 +23,9 @@ const limit = Number(str_arg('limit') ?? DEFAULT_LIMIT);
 
 if (product === undefined || build === undefined)
 	throw new Error('--product and --build are required');
+
+if (classify_product(product) === null)
+	throw new Error(`unknown product family: ${product}`);
 
 async function get_json(url: string): Promise<any> {
 	const res = await fetch(url, { headers: FETCH_HEADERS });
