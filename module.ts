@@ -416,8 +416,12 @@ const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
 // intake state lives in the archavon sqlite db; this vps only owns the CDN objects
 const archavon = archavon_api();
 
-const CACHE_MAX_RETRIES = 2;
+// total worker runs per submission, persisted in status_reason so a process
+// restart (an unhandled worker error aborts the whole process) cannot reset it
+const CACHE_MAX_ATTEMPTS = 3;
 const CACHE_RETRY_BACKOFF = 30000;
+const CACHE_ATTEMPT_PATTERN = /^worker attempt (\d+)\/\d+$/;
+const CACHE_TERMINAL_STATUS = new Set(['completed', 'partial', 'failed']);
 
 // unfinalized submissions older than this are abandoned uploads
 const CACHE_STALE_AGE = 1;
@@ -430,7 +434,6 @@ const CACHE_RECOVER_LIMIT = 1000;
 // backlog rather than live traffic, and are drained one at a time
 const CACHE_BACKLOG_AGE = 24;
 const CACHE_BACKLOG_INTERVAL = 60000;
-const CACHE_BACKLOG_LOOKAHEAD = 32;
 
 // grace period before a terminally failed submission has its CDN objects
 // released, leaving a window to diagnose or replay before the data is gone
@@ -438,10 +441,10 @@ const CACHE_REAP_AGE = 30;
 const CACHE_REAP_BATCH = 200;
 
 const cache_queue: string[] = [];
-const cache_retry_counts = new Map<string, number>();
-const cache_backlog_attempted = new Set<string>();
+let cache_queue_draining = false;
 let cache_worker: Worker | null = null;
 let cache_worker_submission: string | null = null;
+let cache_worker_attempt = 0;
 let cache_worker_memory_resolve: ((data: NodeJS.MemoryUsage) => void) | null = null;
 
 async function cache_fail_submission(submission_id: string, reason: string) {
@@ -450,6 +453,42 @@ async function cache_fail_submission(submission_id: string, reason: string) {
 	} catch (e) {
 		caution('cache: failed to mark crashed submission', { submission_id, error: e });
 	}
+}
+
+// reads the attempt ledger from archavon and records this run in it; returns
+// the attempt number, or null when the submission must not be run
+async function cache_claim_submission(submission_id: string): Promise<number | null> {
+	const submission = await archavon.get_submission(submission_id).catch(e => {
+		if (e?.status === 404)
+			return null;
+
+		throw e;
+	});
+
+	if (submission === null) {
+		log(`cache submission {${submission_id}} not found, skipping`);
+		return null;
+	}
+
+	if (CACHE_TERMINAL_STATUS.has(submission.status) && submission.processed_at !== null) {
+		log(`cache submission {${submission_id}} already ${submission.status}, skipping`);
+		return null;
+	}
+
+	// a row left in 'processing' with no ledger entry was claimed by a worker
+	// that never reported back (process abort), so that run still counts
+	const match = submission.status_reason?.match(CACHE_ATTEMPT_PATTERN);
+	const prior = match ? parseInt(match[1]) : (submission.status === 'processing' ? 1 : 0);
+	const attempt = prior + 1;
+
+	if (attempt > CACHE_MAX_ATTEMPTS) {
+		log(`cache submission {${submission_id}} exhausted ${prior} attempts, marking failed`);
+		await cache_fail_submission(submission_id, `worker failed ${prior} times`);
+		return null;
+	}
+
+	await archavon.update_submission_status({ submission_id, status: 'processing', status_reason: `worker attempt ${attempt}/${CACHE_MAX_ATTEMPTS}` });
+	return attempt;
 }
 
 function spawn_cache_worker(): Worker {
@@ -465,28 +504,25 @@ function spawn_cache_worker(): Worker {
 
 		handled = true;
 		const submission_id = cache_worker_submission;
+		const attempt = cache_worker_attempt;
 		cache_worker = null;
 		cache_worker_submission = null;
+		cache_worker_attempt = 0;
 		let backoff = 0;
 
 		if (!done_received && submission_id !== null) {
-			const attempts = (cache_retry_counts.get(submission_id) ?? 0) + 1;
-			if (attempts <= CACHE_MAX_RETRIES) {
-				cache_retry_counts.set(submission_id, attempts);
+			if (attempt < CACHE_MAX_ATTEMPTS) {
 				cache_queue.push(submission_id);
 
 				// a crash caused by resource exhaustion (db connections, memory) is
 				// still exhausted a millisecond later; respawning immediately just
 				// burns the remaining attempts and deepens the hole
-				backoff = CACHE_RETRY_BACKOFF * attempts;
-				log(`cache worker died on {${submission_id}}, requeued in ${backoff}ms (attempt ${attempts}/${CACHE_MAX_RETRIES})`);
+				backoff = CACHE_RETRY_BACKOFF * attempt;
+				log(`cache worker died on {${submission_id}}, requeued in ${backoff}ms (attempt ${attempt}/${CACHE_MAX_ATTEMPTS})`);
 			} else {
-				cache_retry_counts.delete(submission_id);
-				log(`cache worker died on {${submission_id}}, giving up after ${CACHE_MAX_RETRIES} attempts`);
-				await cache_fail_submission(submission_id, `worker crashed ${CACHE_MAX_RETRIES} times`);
+				log(`cache worker died on {${submission_id}}, giving up after ${attempt} attempts`);
+				await cache_fail_submission(submission_id, `worker failed ${attempt} times`);
 			}
-		} else if (submission_id !== null) {
-			cache_retry_counts.delete(submission_id);
 		}
 
 		if (backoff > 0)
@@ -496,7 +532,7 @@ function spawn_cache_worker(): Worker {
 	}
 
 	worker.onmessage = (event: MessageEvent) => {
-		const { type, text, data } = event.data;
+		const { type, text, data, error } = event.data;
 
 		if (type === 'memory' && cache_worker_memory_resolve) {
 			cache_worker_memory_resolve(data);
@@ -513,9 +549,17 @@ function spawn_cache_worker(): Worker {
 			done_received = true;
 			worker.terminate();
 			handle_exit();
+			return;
+		}
+
+		if (type === 'failed') {
+			caution('cache: failed to process submission', { submission_id: cache_worker_submission, attempt: cache_worker_attempt, error });
+			worker.terminate();
+			handle_exit();
 		}
 	};
 
+	// fallback only; the worker reports its own failures via 'failed'
 	worker.onerror = (event: ErrorEvent) => {
 		caution('cache: worker error', { submission_id: cache_worker_submission, error: event.message ?? event });
 		worker.terminate();
@@ -527,16 +571,36 @@ function spawn_cache_worker(): Worker {
 	return worker;
 }
 
-function process_cache_queue() {
-	if (cache_queue.length === 0 || cache_worker !== null)
+async function process_cache_queue() {
+	if (cache_queue_draining || cache_worker !== null)
 		return;
 
-	const submission_id = cache_queue.shift()!;
-	log(`processing {${submission_id}} (${cache_queue.length} remaining)`);
+	cache_queue_draining = true;
 
-	cache_worker_submission = submission_id;
-	cache_worker = spawn_cache_worker();
-	cache_worker.postMessage({ submission_id });
+	try {
+		while (cache_queue.length > 0 && cache_worker === null) {
+			const submission_id = cache_queue.shift()!;
+
+			let attempt: number | null = null;
+			try {
+				attempt = await cache_claim_submission(submission_id);
+			} catch (e) {
+				caution('cache: failed to claim submission', { submission_id, error: e });
+			}
+
+			if (attempt === null)
+				continue;
+
+			log(`processing {${submission_id}} attempt ${attempt}/${CACHE_MAX_ATTEMPTS} (${cache_queue.length} remaining)`);
+
+			cache_worker_submission = submission_id;
+			cache_worker_attempt = attempt;
+			cache_worker = spawn_cache_worker();
+			cache_worker.postMessage({ submission_id });
+		}
+	} finally {
+		cache_queue_draining = false;
+	}
 }
 
 function cache_worker_get_memory(): Promise<NodeJS.MemoryUsage> {
@@ -746,23 +810,21 @@ async function cache_recover_pending() {
 // pulls a single backlog submission whenever the pipeline is idle, so replayed
 // work never delays live submissions
 async function cache_drain_backlog() {
-	if (cache_queue.length > 0 || cache_worker !== null)
+	if (cache_queue.length > 0 || cache_worker !== null || cache_queue_draining)
 		return;
 
 	try {
 		const candidates = await archavon.list_backlog({
 			min_age_hours: CACHE_BACKLOG_AGE,
-			limit: CACHE_BACKLOG_LOOKAHEAD,
+			limit: 1,
 			order: 'newest'
 		});
 
-		// process_submission can throw without the worker dying, leaving
-		// processed_at NULL; without this the same row would be re-picked forever
-		const next = candidates.submissions.find(row => !cache_backlog_attempted.has(row.submission_id));
+		// a row that keeps failing is marked failed by the claim once its
+		// attempts are spent, which drops it from the backlog
+		const next = candidates.submissions[0];
 		if (next === undefined)
 			return;
-
-		cache_backlog_attempted.add(next.submission_id);
 
 		log(`cache backlog drain picked up {${next.submission_id}}`);
 		cache_queue.push(next.submission_id);

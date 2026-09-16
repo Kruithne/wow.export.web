@@ -2,7 +2,7 @@ import { caution } from 'spooder';
 import { bucket } from './obj_rds';
 import { parse_wdb, type WdbRecord } from './wdb';
 import { parse_dbcache } from './dbcache';
-import { archavon_api, type FailureReason, type SubmissionFile } from './archavon_api';
+import { archavon_api, type FailureReason, type SettableSubmissionStatus, type SubmissionFile } from './archavon_api';
 import { WdbDelta } from './wdb_delta';
 
 const cache_bucket = bucket('wow.export.cache', process.env.CACHE_CDN_SECRET!);
@@ -40,16 +40,39 @@ self.onmessage = async (event: MessageEvent) => {
 	try {
 		await process_submission(submission_id);
 	} catch (e) {
-		caution('cache: failed to process submission', { submission_id, error: e });
-
-		// closing without posting 'done' routes the submission through the retry path;
-		// delta apply is idempotent server-side, so a re-run is safe
-		self.close();
+		// an unhandled throw here aborts the whole bun process (exit 134) and
+		// self.close() does not exist in bun workers; the main thread owns the
+		// caution, the terminate and the retry decision
+		const err = e as Error;
+		self.postMessage({ type: 'failed', error: { name: err?.name, message: err?.message ?? String(e), stack: err?.stack, status: (e as any)?.status } });
 		return;
 	}
 
 	self.postMessage({ type: 'done' });
 };
+
+// mirrors delta_apply_submission in archavon/api/delta.php
+function rollup_status(files: SubmissionFile[]): { status: SettableSubmissionStatus, status_reason: string | null } {
+	const completed = files.filter(f => f.status === 'completed').length;
+	const rejected = files.filter(f => f.status === 'rejected').length;
+	const pending = files.length - completed - rejected;
+	const reasons = new Set(files.filter(f => f.status === 'rejected' && f.failure_reason !== null).map(f => f.failure_reason));
+
+	if (files.length === 0)
+		return { status: 'failed', status_reason: 'submission has no files' };
+
+	if (completed > 0 && rejected === 0 && pending === 0)
+		return { status: 'completed', status_reason: null };
+
+	let status_reason = `${completed}/${files.length} files processed`;
+	if (rejected > 0)
+		status_reason += `, ${rejected} rejected (${[...reasons].join(', ')})`;
+
+	if (pending > 0)
+		status_reason += `, ${pending} unprocessed`;
+
+	return { status: completed === 0 ? 'failed' : 'partial', status_reason };
+}
 
 // drops the cdn object and records the file as rejected in the delta
 async function reject_file(delta: WdbDelta, file: SubmissionFile, reason: FailureReason) {
@@ -79,7 +102,6 @@ async function process_submission(submission_id: string) {
 
 	log(`submission {${submission_id}} ${product} ${patch}.${build_number} (machine: ${machine_id})`);
 
-	await archavon.update_submission_status({ submission_id, status: 'processing' });
 	await archavon.check_machine(machine_id);
 
 	const delta = new WdbDelta(submission_id, machine_id);
@@ -201,8 +223,12 @@ async function process_submission(submission_id: string) {
 		// roll-up, and a failed dispatch throws into the retry path
 		const result = await archavon.upload_delta(submission_id, payload);
 
+		// a re-run of an applied delta finds the roll-up reset to 'processing' by the
+		// claim; the file rows are authoritative, so rebuild the roll-up from them
 		if (result.already_applied) {
-			log(`submission {${submission_id}} delta already applied at ${result.applied_at}`);
+			const rollup = rollup_status(submission.files);
+			await archavon.update_submission_status({ submission_id, ...rollup });
+			log(`submission {${submission_id}} delta already applied at ${result.applied_at}, status reset to ${rollup.status}`);
 			return;
 		}
 
