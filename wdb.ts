@@ -884,11 +884,11 @@ function read_quest_objectives(buf: BufferReader, count: number, ver: GameVersio
 		const percent_amount = buf.readFloatLE();
 
 		const num_visual_effects = buf.readUInt32LE();
-		const visual_effects = buf.readUInt32Array(num_visual_effects);
 
 		if (ver_gte(ver, 11, 2, 7))
-			buf.readUInt32LE(); // WorldEffectID
+			buf.readUInt32LE(); // always 0 in samples, sits before the array (see #1809)
 
+		const visual_effects = buf.readUInt32Array(num_visual_effects);
 		const description_length = buf.readUInt8();
 
 		if (ver_gte(ver, 11, 2, 7) && ver.build >= 64228)
