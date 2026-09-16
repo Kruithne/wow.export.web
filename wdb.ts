@@ -403,7 +403,7 @@ function parse_creature(buf: BufferReader, length: number, ver: GameVersion): Cr
 	};
 }
 
-function parse_quest_classic_common_header(buf: BufferReader): {
+function parse_quest_classic_common_header(buf: BufferReader, has_favor: boolean = false): {
 	quest_id: number; quest_type: number; quest_level: number;
 	quest_scaling_faction_group: number; quest_max_scaling_level: number;
 	quest_package_id: number; quest_min_level: number;
@@ -438,6 +438,10 @@ function parse_quest_classic_common_header(buf: BufferReader): {
 	const reward_spell = buf.readUInt32LE();
 	const reward_honor_addition = buf.readUInt32LE();
 	const reward_honor_multiplier = buf.readFloatLE();
+
+	if (has_favor)
+		buf.readUInt32LE(); // reward_favor
+
 	const reward_artifact_xp_difficulty = buf.readUInt32LE();
 	const reward_artifact_xp_multiplier = buf.readFloatLE();
 	const reward_artifact_category_id = buf.readUInt32LE();
@@ -656,8 +660,22 @@ function parse_quest_classic_era(buf: BufferReader, length: number, ver: GameVer
 	};
 }
 
+// mop classic (wow_classic 5.5.x) runs on the modern engine, so the record is the retail 12.0 quest
+// response with the classic header (level fields, 3 fixed display spells, 4 flags words). verified by
+// exact record consumption on 6282 records across cache builds 68016-69383; every build uses this
+// layout, the previous mop layout matched no record at all.
+//
+// differences from the retail parser:
+// - reward_favor u32 follows reward_honor_multiplier
+// - house/decor counts follow the conditional text counts, arrays follow the counts (always empty in
+//   samples, ordering relative to the treasure picker arrays is unverified)
+// - treasure picker arrays precede the bitpacked lengths, objectives follow them (pre-12.1 ordering)
+// - objective: unk u32 before flags, u32 (always 0) between the visual effect count and the array,
+//   description length is 8 bits + 1 bit (always set) + flush
+// - conditional texts trail the strings
 function parse_quest_mop(buf: BufferReader, length: number, ver: GameVersion): QuestRecord {
-	const h = parse_quest_classic_common_header(buf);
+	const start = buf.offset;
+	const h = parse_quest_classic_common_header(buf, true);
 	const items = parse_quest_classic_items(buf, 4);
 
 	const poi_continent = buf.readUInt32LE();
@@ -670,8 +688,8 @@ function parse_quest_mop(buf: BufferReader, length: number, ver: GameVersion): Q
 	const reward_num_skill_ups = buf.readUInt32LE();
 	const portrait_giver_display_id = buf.readUInt32LE();
 	const portrait_giver_mount_display_id = buf.readUInt32LE();
-	const portrait_model_scene_id = buf.readUInt32LE();
 	const portrait_turn_in_display_id = buf.readUInt32LE();
+	const portrait_model_scene_id = buf.readUInt32LE();
 
 	const faction_rewards: QuestFactionReward[] = [];
 	for (let i = 0; i < 5; i++) {
@@ -707,6 +725,11 @@ function parse_quest_mop(buf: BufferReader, length: number, ver: GameVersion): Q
 	const num_conditional_quest_description = buf.readUInt32LE();
 	const num_conditional_quest_completion = buf.readUInt32LE();
 
+	const num_house_room_rewards = buf.readUInt32LE();
+	const num_decor_rewards = buf.readUInt32LE();
+	buf.readUInt32Array(num_house_room_rewards);
+	buf.readUInt32Array(num_decor_rewards);
+
 	const treasure_picker_ids = buf.readUInt32Array(treasure_picker_id_count);
 	const treasure_picker_ids_2 = buf.readUInt32Array(treasure_picker_id_2_count);
 
@@ -722,6 +745,7 @@ function parse_quest_mop(buf: BufferReader, length: number, ver: GameVersion): Q
 	const portrait_turn_in_name_len = ds.read_bits(8);
 	const quest_completion_log_len = ds.read_bits(11);
 
+	const ready_for_translation = ds.read_bool();
 	const reset_by_scheduler = ds.read_bool();
 
 	ds.flush();
@@ -733,14 +757,18 @@ function parse_quest_mop(buf: BufferReader, length: number, ver: GameVersion): Q
 		const storage_index = buf.readInt8();
 		const object_id = buf.readInt32LE();
 		const amount = buf.readInt32LE();
+		buf.readUInt32LE(); // ObjectiveUNK, uninitialized in samples
 		const obj_flags = buf.readUInt32LE();
 		const obj_flags2 = buf.readUInt32LE();
 		const percent_amount = buf.readFloatLE();
 
 		const num_visual_effects = buf.readUInt32LE();
+		buf.readUInt32LE(); // always 0 in samples, likely WorldEffectID
 		const visual_effects = buf.readUInt32Array(num_visual_effects);
 
-		const description_length = buf.readUInt8();
+		const description_length = ds.read_bits(8);
+		ds.read_bool();
+		ds.flush();
 		const description = ds.read_string(description_length).replace(/\0+$/, '');
 
 		objectives.push({
@@ -768,25 +796,11 @@ function parse_quest_mop(buf: BufferReader, length: number, ver: GameVersion): Q
 	const quest_completion_log = ds.read_string(quest_completion_log_len).replace(/\0+$/, '');
 	ds.flush();
 
-	const conditional_quest_descriptions: ConditionalQuestText[] = [];
-	for (let i = 0; i < num_conditional_quest_description; i++) {
-		const player_condition_id = buf.readUInt32LE();
-		const cond_quest_giver_creature_id = buf.readUInt32LE();
-		const cond_len = ds.read_bits(12);
-		ds.flush();
-		const text = ds.read_string(cond_len).replace(/\0+$/, '');
-		conditional_quest_descriptions.push({ player_condition_id, quest_giver_creature_id: cond_quest_giver_creature_id, text });
-	}
+	const conditional_quest_descriptions = read_conditional_quest_texts(buf, num_conditional_quest_description);
+	const conditional_quest_completions = read_conditional_quest_texts(buf, num_conditional_quest_completion);
 
-	const conditional_quest_completions: ConditionalQuestText[] = [];
-	for (let i = 0; i < num_conditional_quest_completion; i++) {
-		const player_condition_id = buf.readUInt32LE();
-		const cond_quest_giver_creature_id = buf.readUInt32LE();
-		const cond_len = ds.read_bits(12);
-		ds.flush();
-		const text = ds.read_string(cond_len).replace(/\0+$/, '');
-		conditional_quest_completions.push({ player_condition_id, quest_giver_creature_id: cond_quest_giver_creature_id, text });
-	}
+	if (buf.offset !== start + length)
+		throw new Error(`mop quest record consumed ${buf.offset - start} of ${length} bytes`);
 
 	const reward_display_spells: QuestRewardDisplaySpell[] = [];
 	for (const spell_id of h.reward_display_spells_fixed) {
@@ -830,7 +844,7 @@ function parse_quest_mop(buf: BufferReader, length: number, ver: GameVersion): Q
 		portrait_giver_text, portrait_giver_name,
 		portrait_turn_in_text, portrait_turn_in_name,
 		quest_completion_log,
-		ready_for_translation: false, reset_by_scheduler,
+		ready_for_translation, reset_by_scheduler,
 		conditional_quest_descriptions, conditional_quest_completions,
 	};
 }
