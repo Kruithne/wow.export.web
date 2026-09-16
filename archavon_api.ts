@@ -23,6 +23,10 @@ const DELTA_TIMEOUT_MAX_MS = 900000;
 
 const RETRY_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
+// transport failures (timeout, refused, reset) surface as status 0
+const TRANSPORT_STATUS = 0;
+const ERROR_BODY_MAX_CHARS = 200;
+
 // server-side caps, mirrored so oversized batches fail client-side with a useful message
 export const MAX_FILES_PER_REQUEST = 256;
 export const MAX_HASHES_PER_REQUEST = 1024;
@@ -261,9 +265,18 @@ export type ClientOptions = {
 	timeout_ms?: number;
 };
 
-type RequestOptions = {
+export type RequestOptions = {
 	retry_count?: number;
 	timeout_ms?: number;
+};
+
+export type SerializedError = {
+	name: string;
+	message: string;
+	code?: string;
+	status?: number;
+	endpoint?: string;
+	body?: string;
 };
 
 export class ArchavonApiError extends Error {
@@ -271,12 +284,17 @@ export class ArchavonApiError extends Error {
 	readonly endpoint: string;
 	readonly body: string;
 
-	constructor(endpoint: string, status: number, message: string, body: string) {
-		super(`archavon_api: ${endpoint} failed (${status}): ${message}`);
+	constructor(endpoint: string, status: number, message: string, body: string, cause?: unknown) {
+		super(`archavon_api: ${endpoint} failed (${status}): ${message}`, { cause });
 		this.name = 'ArchavonApiError';
 		this.status = status;
 		this.endpoint = endpoint;
 		this.body = body;
+	}
+
+	// transport errors and the status set the client itself retries on
+	get retryable(): boolean {
+		return this.status === TRANSPORT_STATUS || RETRY_STATUS.has(this.status);
 	}
 }
 
@@ -301,9 +319,48 @@ export function delta_timeout_ms(byte_length: number): number {
 	return Math.min(DELTA_TIMEOUT_BASE_MS + Math.ceil(byte_length / (1024 * 1024)) * DELTA_TIMEOUT_PER_MB_MS, DELTA_TIMEOUT_MAX_MS);
 }
 
-// AbortSignal.timeout rejects with a DOMException, not an ArchavonApiError
+// AbortSignal.timeout rejects with a DOMException; send() wraps it as the cause
+// of a transport ArchavonApiError
 export function is_timeout_error(error: unknown): boolean {
-	return (error as { name?: string } | null)?.name === 'TimeoutError';
+	const err = error as { name?: string; cause?: { name?: string } } | null;
+	return err?.name === 'TimeoutError' || err?.cause?.name === 'TimeoutError';
+}
+
+// failures the caller should answer with 503: retryable api errors and raw
+// timeouts from fetches outside the client
+export function is_upstream_error(error: unknown): boolean {
+	if (error instanceof ArchavonApiError)
+		return error.retryable;
+
+	return is_timeout_error(error);
+}
+
+// DOMException/TimeoutError have no enumerable props, so a bare error logs as {}
+export function serialize_error(error: unknown): SerializedError {
+	const err = error as { name?: string; message?: string; code?: string; cause?: { code?: string } } | null;
+	const out: SerializedError = {
+		name: typeof err?.name === 'string' ? err.name : typeof error,
+		message: typeof err?.message === 'string' ? err.message : String(error)
+	};
+
+	const code = typeof err?.code === 'string' ? err.code : err?.cause?.code;
+	if (typeof code === 'string')
+		out.code = code;
+
+	if (error instanceof ArchavonApiError) {
+		out.status = error.status;
+		out.endpoint = error.endpoint;
+
+		if (error.body.length > 0)
+			out.body = error.body;
+	}
+
+	return out;
+}
+
+function truncate_body(body: string): string {
+	const collapsed = body.replace(/\s+/g, ' ').trim();
+	return collapsed.length > ERROR_BODY_MAX_CHARS ? collapsed.slice(0, ERROR_BODY_MAX_CHARS) + '...' : collapsed;
 }
 
 function delay(ms: number): Promise<void> {
@@ -319,19 +376,27 @@ function assert_limit(label: string, length: number, max: number) {
 		throw new RangeError(`archavon_api: ${label} exceeds server limit (${length} > ${max})`);
 }
 
+// non-json bodies (cloudflare html error pages) are truncated so they never
+// become a caution title
 async function error_from_response(endpoint: string, res: Response): Promise<ArchavonApiError> {
-	const body = await res.text().catch(() => '');
+	const raw = await res.text().catch(() => '');
+	const body = truncate_body(raw);
 	let message = body;
 
 	try {
-		const parsed = JSON.parse(body);
+		const parsed = JSON.parse(raw);
 		if (parsed && typeof parsed.error === 'string')
 			message = parsed.error;
-	} catch {
-		// non-json error body; the raw text is the message
-	}
+	} catch {}
 
 	return new ArchavonApiError(endpoint, res.status, message || res.statusText, body);
+}
+
+function transport_error(endpoint: string, error: unknown): ArchavonApiError {
+	const err = error as { message?: string; code?: string } | null;
+	const reason = typeof err?.message === 'string' ? err.message : String(error);
+
+	return new ArchavonApiError(endpoint, TRANSPORT_STATUS, typeof err?.code === 'string' ? `${err.code}: ${reason}` : reason, '', error);
 }
 
 export function archavon_api(options: ClientOptions = {}) {
@@ -380,7 +445,7 @@ export function archavon_api(options: ClientOptions = {}) {
 					throw error;
 
 				if (attempt >= max_attempts - 1)
-					throw error;
+					throw transport_error(endpoint, error);
 
 				await delay(backoff_delay(retry_delay_ms, attempt++));
 			}
@@ -405,16 +470,16 @@ export function archavon_api(options: ClientOptions = {}) {
 
 	return {
 		// upserts the machine and reports block state
-		check_machine: (machine_id: string, hardware_hash?: string): Promise<MachineState> => {
+		check_machine: (machine_id: string, hardware_hash?: string, opts: RequestOptions = {}): Promise<MachineState> => {
 			const payload: Record<string, unknown> = { machine_id };
 			if (hardware_hash !== undefined)
 				payload.hardware_hash = hardware_hash;
 
-			return post_json<MachineState>('intake/machine', payload);
+			return post_json<MachineState>('intake/machine', payload, opts);
 		},
 
 		// omit file_names to fetch every file of the build
-		get_binary_hashes: (build_key: string, file_names?: string[]): Promise<BinaryHashLookup> => {
+		get_binary_hashes: (build_key: string, file_names?: string[], opts: RequestOptions = {}): Promise<BinaryHashLookup> => {
 			const payload: Record<string, unknown> = { build_key };
 
 			if (file_names !== undefined) {
@@ -422,14 +487,14 @@ export function archavon_api(options: ClientOptions = {}) {
 				payload.file_names = file_names;
 			}
 
-			return post_json<BinaryHashLookup>('intake/hashes', payload);
+			return post_json<BinaryHashLookup>('intake/hashes', payload, opts);
 		},
 
 		// re-storing is a no-op
-		store_binary_hashes: (build_key: string, hashes: BinaryHashEntry[]): Promise<BinaryHashStoreResult> => {
+		store_binary_hashes: (build_key: string, hashes: BinaryHashEntry[], opts: RequestOptions = {}): Promise<BinaryHashStoreResult> => {
 			assert_limit('hashes', hashes.length, MAX_HASHES_PER_REQUEST);
 
-			return post_json<BinaryHashStoreResult>('intake/hashes/store', { build_key, hashes });
+			return post_json<BinaryHashStoreResult>('intake/hashes/store', { build_key, hashes }, opts);
 		},
 
 		// db2 table-hash mapping upsert (WoWDBDefs manifest sync)
@@ -447,15 +512,15 @@ export function archavon_api(options: ClientOptions = {}) {
 			return post_json<CreateSubmissionResult>('intake/submission', req as unknown as Record<string, unknown>, opts);
 		},
 
-		get_submission: (submission_id: string): Promise<SubmissionDetail> => {
-			return post_json<SubmissionDetail>('intake/submission/files', { submission_id });
+		get_submission: (submission_id: string, opts: RequestOptions = {}): Promise<SubmissionDetail> => {
+			return post_json<SubmissionDetail>('intake/submission/files', { submission_id }, opts);
 		},
 
 		// drops files absent from `keep` and returns their object_ids
-		finalize_submission: (submission_id: string, keep: FileRef[]): Promise<FinalizeResult> => {
+		finalize_submission: (submission_id: string, keep: FileRef[], opts: RequestOptions = {}): Promise<FinalizeResult> => {
 			assert_limit('keep', keep.length, MAX_FILES_PER_REQUEST);
 
-			return post_json<FinalizeResult>('intake/submission/finalize', { submission_id, keep });
+			return post_json<FinalizeResult>('intake/submission/finalize', { submission_id, keep }, opts);
 		},
 
 		update_submission_status: (req: UpdateStatusRequest): Promise<UpdateStatusResult> => {

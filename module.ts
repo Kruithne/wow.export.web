@@ -7,7 +7,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { ColorInput } from 'bun';
 import { db } from './db';
-import { archavon_api, ArchavonApiError, MAX_FILES_PER_REQUEST, MAX_HASHES_PER_REQUEST, type BinaryHashEntry, type FileRef, type SubmissionFileInput } from './archavon_api';
+import { archavon_api, ArchavonApiError, is_upstream_error, serialize_error, MAX_FILES_PER_REQUEST, MAX_HASHES_PER_REQUEST, type BinaryHashEntry, type FileRef, type RequestOptions, type SubmissionFileInput } from './archavon_api';
 import { blte_unpack } from './casc/blte';
 import { tact_load_keys } from './casc/tact';
 import { bucket } from './obj_rds';
@@ -646,6 +646,12 @@ const CACHE_RATE_WINDOW = 24 * 60 * 60 * 1000; // 24h
 const CACHE_RATE_MAX_MACHINE = 20;
 const CACHE_RATE_MAX_IP = 50;
 
+// wall-time cap for archavon calls on the submit/finalize request path; the
+// client's default retry schedule (4 x 30s) belongs to background jobs only
+const CACHE_REQUEST_BUDGET_MS = 12000;
+const CACHE_REQUEST_MIN_TIMEOUT_MS = 1000;
+const CACHE_RETRY_AFTER_S = 120;
+
 const cache_rate_machine: Map<string, number[]> = new Map();
 const cache_rate_ip: Map<string, number[]> = new Map();
 
@@ -667,6 +673,25 @@ function check_rate_limit(map: Map<string, number[]>, key: string, max: number):
 	recent.push(now);
 	map.set(key, recent);
 	return false;
+}
+
+// single attempt per call, each bounded by what remains of the request budget
+function cache_request_budget(): () => RequestOptions {
+	const deadline = Date.now() + CACHE_REQUEST_BUDGET_MS;
+	return () => ({ retry_count: 0, timeout_ms: Math.max(deadline - Date.now(), CACHE_REQUEST_MIN_TIMEOUT_MS) });
+}
+
+// upstream (archavon/timeout) failures answer 503 + retry-after so clients back
+// off; anything else is a genuine 500. one caution either way, with context
+function cache_request_failure(route: string, e: unknown, submission_id: string): Response | number {
+	const error = serialize_error(e);
+	const reason = error.endpoint !== undefined ? `${error.endpoint} ${error.status}` : error.name;
+	caution(`cache ${route} failed: ${reason}`, { route, submission_id, error });
+
+	if (!is_upstream_error(e))
+		return HTTP_STATUS_CODE.InternalServerError_500;
+
+	return new Response(null, { status: HTTP_STATUS_CODE.ServiceUnavailable_503, headers: { 'Retry-After': String(CACHE_RETRY_AFTER_S) } });
 }
 
 function get_client_ip(req: Request): string {
@@ -848,74 +873,71 @@ function cache_is_valid_uuid(str: unknown): boolean {
 }
 
 // parses the build's INSTALL manifest and stores the binary hashes it carries;
-// the caller checks `known` first, so this only runs for a build we've not seen
-async function cache_fetch_build_hashes(build_key: string): Promise<void> {
-	try {
-		const config_res = await casc_download(casc_url_join(casc_cdn_path, 'config', casc_format_key(build_key)));
-		const config_text = await config_res.text();
+// the caller checks `known` first, so this only runs for a build we've not seen.
+// failures propagate so the request path classifies and reports them once
+async function cache_fetch_build_hashes(build_key: string, budget: () => RequestOptions): Promise<void> {
+	const config_res = await casc_download(casc_url_join(casc_cdn_path, 'config', casc_format_key(build_key)));
+	const config_text = await config_res.text();
 
-		let install_encoding_hash: string | null = null;
-		for (const line of config_text.split('\n')) {
-			const trimmed = line.trim();
-			if (trimmed.startsWith('install')) {
-				const parts = trimmed.split(/\s*=\s*/);
-				if (parts.length >= 2) {
-					const hashes = parts[1]!.trim().split(/\s+/);
-					if (hashes.length >= 2)
-						install_encoding_hash = hashes[1]!;
-				}
-				break;
+	let install_encoding_hash: string | null = null;
+	for (const line of config_text.split('\n')) {
+		const trimmed = line.trim();
+		if (trimmed.startsWith('install')) {
+			const parts = trimmed.split(/\s*=\s*/);
+			if (parts.length >= 2) {
+				const hashes = parts[1]!.trim().split(/\s+/);
+				if (hashes.length >= 2)
+					install_encoding_hash = hashes[1]!;
 			}
+			break;
 		}
-
-		if (!install_encoding_hash)
-			return;
-
-		const data_res = await casc_download_data(install_encoding_hash);
-		const raw_data = await data_res.arrayBuffer();
-		const unpacked = blte_unpack(raw_data, install_encoding_hash, false);
-		const reader = new BufferReader(unpacked);
-
-		const signature = reader.readUInt16LE();
-		if (signature !== 0x4E49)
-			return;
-
-		reader.readUInt8(); // version
-		const hash_size = reader.readUInt8();
-		const num_tags = reader.readUInt16BE();
-		const num_files = reader.readUInt32BE();
-		const mask_size = Math.ceil(num_files / 8);
-
-		// skip tags
-		for (let i = 0; i < num_tags; i++) {
-			reader.readNullTermString();
-			reader.readUInt16BE();
-			reader.move(mask_size);
-		}
-
-		// read files
-		const executables: BinaryHashEntry[] = [];
-		for (let i = 0; i < num_files; i++) {
-			const name = reader.readNullTermString();
-			const hash = reader.readHexString(hash_size);
-			const size = reader.readUInt32BE();
-
-			if (name.endsWith('.exe') || name.includes('.app/')) {
-				if (is_filtered_binary(name))
-					continue;
-
-				executables.push({ file_name: name, content_hash: hash, file_size: size });
-			}
-		}
-
-		if (executables.length === 0)
-			return;
-
-		for (let i = 0; i < executables.length; i += MAX_HASHES_PER_REQUEST)
-			await archavon.store_binary_hashes(build_key, executables.slice(i, i + MAX_HASHES_PER_REQUEST));
-	} catch (e) {
-		caution('cache: failed to fetch build hashes', { build_key, error: e });
 	}
+
+	if (!install_encoding_hash)
+		return;
+
+	const data_res = await casc_download_data(install_encoding_hash);
+	const raw_data = await data_res.arrayBuffer();
+	const unpacked = blte_unpack(raw_data, install_encoding_hash, false);
+	const reader = new BufferReader(unpacked);
+
+	const signature = reader.readUInt16LE();
+	if (signature !== 0x4E49)
+		return;
+
+	reader.readUInt8(); // version
+	const hash_size = reader.readUInt8();
+	const num_tags = reader.readUInt16BE();
+	const num_files = reader.readUInt32BE();
+	const mask_size = Math.ceil(num_files / 8);
+
+	// skip tags
+	for (let i = 0; i < num_tags; i++) {
+		reader.readNullTermString();
+		reader.readUInt16BE();
+		reader.move(mask_size);
+	}
+
+	// read files
+	const executables: BinaryHashEntry[] = [];
+	for (let i = 0; i < num_files; i++) {
+		const name = reader.readNullTermString();
+		const hash = reader.readHexString(hash_size);
+		const size = reader.readUInt32BE();
+
+		if (name.endsWith('.exe') || name.includes('.app/')) {
+			if (is_filtered_binary(name))
+				continue;
+
+			executables.push({ file_name: name, content_hash: hash, file_size: size });
+		}
+	}
+
+	if (executables.length === 0)
+		return;
+
+	for (let i = 0; i < executables.length; i += MAX_HASHES_PER_REQUEST)
+		await archavon.store_binary_hashes(build_key, executables.slice(i, i + MAX_HASHES_PER_REQUEST), budget());
 }
 // endregion
 
@@ -2519,11 +2541,6 @@ export async function init(server: SpooderServer) {
 		if (check_rate_limit(cache_rate_ip, client_ip, CACHE_RATE_MAX_IP))
 			return HTTP_STATUS_CODE.TooManyRequests_429;
 
-		const machine = await archavon.check_machine(machine_id);
-
-		if (machine.blocked)
-			return HTTP_STATUS_CODE.Forbidden_403;
-
 		if (typeof product !== 'string' || product.length === 0 || product.length > 32 || !CACHE_PRODUCT_PATTERN.test(product))
 			return HTTP_STATUS_CODE.BadRequest_400;
 
@@ -2587,31 +2604,37 @@ export async function init(server: SpooderServer) {
 				return HTTP_STATUS_CODE.BadRequest_400;
 		}
 
-		await casc_ready;
-
-		// `known` covers the whole build, so a cold build costs the manifest fetch
-		// once and every later submission for it is a single lookup
-		let known_hashes = await archavon.get_binary_hashes(build_key, submitted_names);
-		if (!known_hashes.known) {
-			await cache_fetch_build_hashes(build_key);
-			known_hashes = await archavon.get_binary_hashes(build_key, submitted_names);
-		}
-
-		// no known hashes for this build, cannot verify
-		if (Object.keys(known_hashes.hashes).length === 0)
-			return HTTP_STATUS_CODE.Forbidden_403;
-
-		// reject if any matched file has a hash not in the known set; several
-		// hashes per name are expected, multi-arch builds ship one binary each
-		for (const [name, entries] of Object.entries(known_hashes.hashes)) {
-			if (!entries.some(entry => entry.content_hash === binary_hashes[name]))
-				return HTTP_STATUS_CODE.Forbidden_403;
-		}
-
+		const budget = cache_request_budget();
 		const submission_id = crypto.randomUUID();
 		const provisioned: Array<{ object_id: string; file: any }> = [];
 
 		try {
+			const machine = await archavon.check_machine(machine_id, undefined, budget());
+
+			if (machine.blocked)
+				return HTTP_STATUS_CODE.Forbidden_403;
+
+			await casc_ready;
+
+			// `known` covers the whole build, so a cold build costs the manifest fetch
+			// once and every later submission for it is a single lookup
+			let known_hashes = await archavon.get_binary_hashes(build_key, submitted_names, budget());
+			if (!known_hashes.known) {
+				await cache_fetch_build_hashes(build_key, budget);
+				known_hashes = await archavon.get_binary_hashes(build_key, submitted_names, budget());
+			}
+
+			// no known hashes for this build, cannot verify
+			if (Object.keys(known_hashes.hashes).length === 0)
+				return HTTP_STATUS_CODE.Forbidden_403;
+
+			// reject if any matched file has a hash not in the known set; several
+			// hashes per name are expected, multi-arch builds ship one binary each
+			for (const [name, entries] of Object.entries(known_hashes.hashes)) {
+				if (!entries.some(entry => entry.content_hash === binary_hashes[name]))
+					return HTTP_STATUS_CODE.Forbidden_403;
+			}
+
 			const upload_urls: Record<string, string> = {};
 			const file_rows: SubmissionFileInput[] = [];
 
@@ -2647,7 +2670,7 @@ export async function init(server: SpooderServer) {
 				binary_hash: binary_hashes,
 				client_ip: client_ip_hash,
 				files: file_rows
-			});
+			}, budget());
 
 			return { submission_id, upload_urls };
 		} catch (e) {
@@ -2658,8 +2681,7 @@ export async function init(server: SpooderServer) {
 				} catch {}
 			}
 
-			caution('cache submit failed', { error: e, submission_id });
-			return HTTP_STATUS_CODE.InternalServerError_500;
+			return cache_request_failure('submit', e, submission_id);
 		}
 	});
 
@@ -2675,8 +2697,10 @@ export async function init(server: SpooderServer) {
 		if (typeof checksums !== 'object' || checksums === null || Array.isArray(checksums))
 			return HTTP_STATUS_CODE.BadRequest_400;
 
+		const budget = cache_request_budget();
+
 		try {
-			const submission = await archavon.get_submission(submission_id);
+			const submission = await archavon.get_submission(submission_id, budget());
 
 			if (submission.finalized_at !== null)
 				return HTTP_STATUS_CODE.Conflict_409;
@@ -2704,7 +2728,7 @@ export async function init(server: SpooderServer) {
 				}
 			}
 
-			await archavon.finalize_submission(submission_id, keep);
+			await archavon.finalize_submission(submission_id, keep, budget());
 
 			cache_queue.push(submission_id);
 			process_cache_queue();
@@ -2717,8 +2741,7 @@ export async function init(server: SpooderServer) {
 			if (e instanceof ArchavonApiError && e.status === 409)
 				return HTTP_STATUS_CODE.Conflict_409;
 
-			caution('cache finalize failed', { error: e, submission_id });
-			return HTTP_STATUS_CODE.InternalServerError_500;
+			return cache_request_failure('finalize', e, submission_id);
 		}
 	});
 
