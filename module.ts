@@ -1478,65 +1478,135 @@ const LISTFILE_BINARY_FILES = [
 	'listfile-id-index-fat.dat',
 ];
 
-async function update_listfile() {
+const GITHUB_CHECK_STATE_FILE = './wow.export/data/github_checks.json';
+const GITHUB_CHECK_COOLDOWN = 30 * 60 * 1000;
+const GITHUB_CHECK_FAIL_THRESHOLD = 3;
+
+type GithubCheckState = Record<string, { last_success?: number; failures?: number }>;
+let github_check_state: GithubCheckState | null = null;
+
+async function github_check_state_read(): Promise<GithubCheckState> {
+	if (github_check_state)
+		return github_check_state;
+
+	try {
+		const state = await Bun.file(GITHUB_CHECK_STATE_FILE).json();
+		github_check_state = typeof state === 'object' && state !== null ? state : {};
+	} catch {
+		github_check_state = {};
+	}
+
+	return github_check_state!;
+}
+
+async function github_check_state_write(name: string, entry: GithubCheckState[string]): Promise<void> {
+	try {
+		const state = await github_check_state_read();
+		state[name] = { ...state[name], ...entry };
+		await fs.mkdir(path.dirname(GITHUB_CHECK_STATE_FILE), { recursive: true });
+		await v3_atomic_write(GITHUB_CHECK_STATE_FILE, JSON.stringify(state));
+	} catch (e) {
+		log(`failed to persist github check state for {${name}}: ${e instanceof Error ? e.message : String(e)}`);
+	}
+}
+
+// resolves head sha for a github ref; null means skip (cooldown or failure)
+// transient failures (rate limit, 5xx, network) only raise a caution after
+// repeated consecutive failures or when no local data exists to fall back on
+async function github_check_head(name: string, url: string, force: boolean, has_local: boolean): Promise<{ sha: string; body: any } | null> {
+	const state = await github_check_state_read();
+	const entry = state[name] ?? {};
+	const now = Date.now();
+
+	if (!force && entry.last_success && now - entry.last_success < GITHUB_CHECK_COOLDOWN) {
+		log(`skipping ${name} version check, last checked {${Math.round((now - entry.last_success) / 60000)}m} ago`);
+		return null;
+	}
+
+	let reason: string;
+	let meta: Record<string, unknown>;
+	let transient = true;
+
+	try {
+		const res = await fetch(url);
+		if (res.ok) {
+			const body = await res.json() as any;
+			const sha = body?.object?.sha;
+
+			if (typeof sha !== 'string' || !V3_LISTFILE_SHA_PATTERN.test(sha)) {
+				caution(`Failed to parse ${name} version`, { body });
+				return null;
+			}
+
+			await github_check_state_write(name, { last_success: now, failures: 0 });
+			return { sha, body };
+		}
+
+		const rate_limited = (res.status === 403 || res.status === 429) && res.headers.get('x-ratelimit-remaining') === '0';
+		transient = rate_limited || res.status >= 500;
+		reason = rate_limited ? 'rate limited' : `http ${res.status}`;
+		meta = { status: res.status, ratelimit_reset: res.headers.get('x-ratelimit-reset') };
+	} catch (error) {
+		reason = error instanceof Error ? error.message : String(error);
+		meta = { error: reason };
+	}
+
+	const failures = (entry.failures ?? 0) + 1;
+	await github_check_state_write(name, { failures });
+
+	if (!transient || failures >= GITHUB_CHECK_FAIL_THRESHOLD || !has_local)
+		caution(`Failed to check ${name} version`, { ...meta, failures, has_local });
+	else
+		log(`${name} version check failed ({${reason}}), retry later ({${failures}}/{${GITHUB_CHECK_FAIL_THRESHOLD}})`);
+
+	return null;
+}
+
+async function update_listfile(force = false) {
 	const target_dir = './wow.export/data/listfile';
 	const version_file = path.join(target_dir, 'version.json');
 
+	const has_local = await fs.stat(version_file).then(() => true, () => false);
+	const remote = await github_check_head('listfile', 'https://api.github.com/repos/wowdev/wow-listfile/git/refs/heads/master', force, has_local);
+	if (!remote)
+		return;
+
+	const remote_sha = remote.sha;
+	const remote_head = remote.body;
 	let should_update = false;
-	let remote_head: any = null;
 
 	try {
-		const version_res = await fetch('https://api.github.com/repos/wowdev/wow-listfile/git/refs/heads/master');
-		if (!version_res.ok) {
-			caution('Failed to check listfile version', { status: version_res.status });
-			return;
-		}
+		const local_version = await Bun.file(version_file).json();
+		const local_sha = local_version?.object?.sha;
 
-		remote_head = await version_res.json();
-		const remote_sha = remote_head?.object?.sha;
+		if (local_sha === remote_sha) {
+			let v3_current = false;
+			try {
+				const v3_version = await Bun.file(path.join(V3_LISTFILE_DIR, 'version.json')).json();
+				v3_current = v3_version?.sha === remote_sha;
+			} catch {}
 
-		if (!remote_sha) {
-			caution('Failed to parse listfile version', { remote_head });
-			return;
-		}
-
-		try {
-			const local_version = await Bun.file(version_file).json();
-			const local_sha = local_version?.object?.sha;
-
-			if (local_sha === remote_sha) {
-				let v3_current = false;
-				try {
-					const v3_version = await Bun.file(path.join(V3_LISTFILE_DIR, 'version.json')).json();
-					v3_current = v3_version?.sha === remote_sha;
-				} catch {}
-
-				if (v3_current) {
-					log(`listfile is up to date ({${remote_sha.substring(0, 8)}})`);
-					return;
-				}
-
-				log(`building v3 listfile from existing master ({${remote_sha.substring(0, 8)}})`);
-
-				try {
-					await v3_listfile_build(remote_sha, await Bun.file(path.join(target_dir, 'master')).text());
-				} catch (e) {
-					caution('Failed to build v3 listfile', [e instanceof Error ? e.message : String(e)]);
-				}
-
+			if (v3_current) {
+				log(`listfile is up to date ({${remote_sha.substring(0, 8)}})`);
 				return;
 			}
 
-			log(`listfile update available: {${local_sha?.substring(0, 8)}} -> {${remote_sha.substring(0, 8)}}`);
-			should_update = true;
-		} catch (e) {
-			// version.json doesn't exist or is invalid, proceed with update
-			log('no local listfile version found, proceeding with update');
-			should_update = true;
+			log(`building v3 listfile from existing master ({${remote_sha.substring(0, 8)}})`);
+
+			try {
+				await v3_listfile_build(remote_sha, await Bun.file(path.join(target_dir, 'master')).text());
+			} catch (e) {
+				caution('Failed to build v3 listfile', [e instanceof Error ? e.message : String(e)]);
+			}
+
+			return;
 		}
-	} catch (error) {
-		caution('Failed to check listfile version', [error instanceof Error ? error.message : String(error)]);
-		return;
+
+		log(`listfile update available: {${local_sha?.substring(0, 8)}} -> {${remote_sha.substring(0, 8)}}`);
+		should_update = true;
+	} catch (e) {
+		log('no local listfile version found, proceeding with update');
+		should_update = true;
 	}
 
 	if (!should_update)
@@ -1570,7 +1640,7 @@ async function update_listfile() {
 			await fs.rename(src, dst);
 		}
 
-		await v3_listfile_build(remote_head.object.sha, await Bun.file(path.join(target_dir, 'master')).text());
+		await v3_listfile_build(remote_sha, await Bun.file(path.join(target_dir, 'master')).text());
 
 		await Bun.write(version_file, JSON.stringify(remote_head, null, 2));
 		log(`saved listfile version to {${version_file}}`);
@@ -1694,30 +1764,15 @@ async function v3_tact_build(sha: string, entries: Map<string, string>): Promise
 	log(`v3 tact keys published {${sha.substring(0, 8)}} ({${entries.size}} keys)`);
 }
 
-async function update_tact() {
+async function update_tact(force = false) {
 	const target_dir = './wow.export/data/tact';
-	let remote_sha: string;
 
-	try {
-		const version_res = await fetch('https://api.github.com/repos/wowdev/TACTKeys/git/refs/heads/master');
-		if (!version_res.ok) {
-			caution('Failed to check tact keys version', { status: version_res.status });
-			return;
-		}
-
-		const remote_head = await version_res.json() as any;
-		const sha = remote_head?.object?.sha;
-
-		if (typeof sha !== 'string' || !V3_TACT_SHA_PATTERN.test(sha)) {
-			caution('Failed to parse tact keys version', { remote_head });
-			return;
-		}
-
-		remote_sha = sha;
-	} catch (error) {
-		caution('Failed to check tact keys version', [error instanceof Error ? error.message : String(error)]);
+	const has_local = await fs.stat(path.join(V3_TACT_DIR, 'version.json')).then(() => true, () => false);
+	const remote = await github_check_head('tact keys', 'https://api.github.com/repos/wowdev/TACTKeys/git/refs/heads/master', force, has_local);
+	if (!remote)
 		return;
-	}
+
+	const remote_sha = remote.sha;
 
 	try {
 		const v3_version = await Bun.file(path.join(V3_TACT_DIR, 'version.json')).json();
@@ -2344,35 +2399,35 @@ export async function init(server: SpooderServer) {
 	let is_updating_tact = false;
 	let is_updating_dbd = false;
 
-	async function trigger_listfile_update() {
+	async function trigger_listfile_update(force = false) {
 		if (is_updating_listfile)
 			return;
 
 		is_updating_listfile = true;
-		await update_listfile();
+		await update_listfile(force);
 		is_updating_listfile = false;
 	}
 
 	trigger_listfile_update(); // update listfile on server start
 
 	server.webhook(process.env.LISTFILE_WEBHOOK_SECRET!, '/wow.export/v2/trigger_listfile_rebuild', (payload) => {
-		setImmediate(trigger_listfile_update);
+		setImmediate(() => trigger_listfile_update(true));
 		return 200;
 	});
 
-	async function trigger_tact_update() {
+	async function trigger_tact_update(force = false) {
 		if (is_updating_tact)
 			return;
 
 		is_updating_tact = true;
-		await update_tact();
+		await update_tact(force);
 		is_updating_tact = false;
 	}
 
 	trigger_tact_update(); // update tact keys on server start
 
 	server.webhook(process.env.LISTFILE_WEBHOOK_SECRET!, '/wow.export/v2/trigger_tact_rebuild', (payload) => {
-		setImmediate(trigger_tact_update);
+		setImmediate(() => trigger_tact_update(true));
 		return 200;
 	});
 
