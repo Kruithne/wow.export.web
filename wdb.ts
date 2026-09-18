@@ -22,7 +22,14 @@ const CLASSIC_MODERN_ENGINE_BUILD = 62824;
 // classic gameobject trailing u32 absent on 3.4.x (<= 62824) and 1.14.x, present from 67156
 const CLASSIC_GOB_TRAILING_BUILD = 67156;
 
+// forever (wow_classic 1.60+, beta build 69893) writes the retail 12.1 creature, gameobject and quest
+// records; only the quest header differs (classic level fields, see parse_quest_body). the retail
+// parsers gate on retail version numbers, so forever parses as 12.1. verified by exact record
+// consumption on the 1.60.1 beta cache
+const FOREVER_LAYOUT_VERSION = { expansion: 12, major: 1, minor: 0 };
+
 type ProductFamily = 'retail' | 'classic';
+type LayoutFamily = ProductFamily | 'forever';
 type ClassicQuestLayout = 'era' | 'anniversary' | 'wrath' | 'vanilla';
 
 interface GameVersion {
@@ -31,7 +38,7 @@ interface GameVersion {
 	minor: number;
 	build: number;
 	product: string;
-	family: ProductFamily;
+	family: LayoutFamily;
 }
 
 interface ProductInfo {
@@ -53,7 +60,7 @@ export function classify_product(product: string): ProductInfo | null {
 
 function parse_game_version(patch: string, build: number, info: ProductInfo): GameVersion {
 	const parts = patch.split('.').map(Number);
-	return {
+	const ver: GameVersion = {
 		expansion: parts[0] ?? 0,
 		major: parts[1] ?? 0,
 		minor: parts[2] ?? 0,
@@ -61,6 +68,16 @@ function parse_game_version(patch: string, build: number, info: ProductInfo): Ga
 		product: info.product,
 		family: info.family
 	};
+
+	if (is_forever(ver))
+		return { ...ver, ...FOREVER_LAYOUT_VERSION, family: 'forever' };
+
+	return ver;
+}
+
+// the wow_classic slot has only ever carried 3.4.x+ progression clients, so a 1.x patch is forever
+function is_forever(ver: GameVersion): boolean {
+	return ver.product === 'wow_classic' && ver.expansion === 1;
 }
 
 function is_classic(ver: GameVersion): boolean {
@@ -1044,8 +1061,21 @@ function parse_quest(buf: BufferReader, length: number, ver: GameVersion): Quest
 function parse_quest_body(buf: BufferReader, length: number, ver: GameVersion, objectives_first: boolean): QuestRecord {
 	const quest_id = buf.readUInt32LE();
 	const quest_type = buf.readUInt32LE();
-	const quest_package_id = buf.readUInt32LE();
-	const content_tuning_id = buf.readUInt32LE();
+
+	// forever carries the classic level fields here and no content tuning id; the third word tracks
+	// the quest level in samples (min level), the second and fourth are 0 in every sample
+	let quest_package_id: number;
+	let content_tuning_id = 0;
+	if (ver.family === 'forever') {
+		buf.readUInt32LE(); // quest_level
+		buf.readUInt32LE(); // unk
+		buf.readUInt32LE(); // quest_min_level
+		quest_package_id = buf.readUInt32LE();
+	} else {
+		quest_package_id = buf.readUInt32LE();
+		content_tuning_id = buf.readUInt32LE();
+	}
+
 	const quest_sort_id = buf.readInt32LE();
 	const quest_info_id = buf.readUInt32LE();
 	const suggested_group_num = buf.readUInt32LE();
