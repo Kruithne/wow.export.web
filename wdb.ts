@@ -216,6 +216,8 @@ interface QuestRecord {
 	quest_type: number;
 	quest_package_id: number;
 	content_tuning_id: number;
+	quest_level?: number;
+	quest_min_level?: number;
 	quest_sort_id: number;
 	quest_info_id: number;
 	suggested_group_num: number;
@@ -1062,15 +1064,18 @@ function parse_quest_body(buf: BufferReader, length: number, ver: GameVersion, o
 	const quest_id = buf.readUInt32LE();
 	const quest_type = buf.readUInt32LE();
 
-	// forever carries the classic level fields here and no content tuning id; the third word tracks
-	// the quest level in samples (min level), the second and fourth are 0 in every sample
+	// forever carries classic level words here and no content tuning id: quest_level, unk (0 in
+	// every sample), quest_min_level. verified on 1.60.1 build 69913 against vanilla values.
+	// the level fields stay absent on retail so its content hash keeps matching archavon
 	let quest_package_id: number;
 	let content_tuning_id = 0;
+	let levels: { quest_level: number; quest_min_level: number } | null = null;
 	if (ver.family === 'forever') {
-		buf.readUInt32LE(); // quest_level
-		buf.readUInt32LE(); // unk
-		buf.readUInt32LE(); // quest_min_level
+		const quest_level = buf.readInt32LE();
+		buf.readUInt32LE();
+		const quest_min_level = buf.readInt32LE();
 		quest_package_id = buf.readUInt32LE();
+		levels = { quest_level, quest_min_level };
 	} else {
 		quest_package_id = buf.readUInt32LE();
 		content_tuning_id = buf.readUInt32LE();
@@ -1246,6 +1251,7 @@ function parse_quest_body(buf: BufferReader, length: number, ver: GameVersion, o
 
 	return {
 		quest_id, quest_type, quest_package_id, content_tuning_id,
+		...(levels ?? {}),
 		quest_sort_id, quest_info_id, suggested_group_num,
 		reward_next_quest, reward_xp_difficulty, reward_xp_multiplier,
 		reward_money, reward_money_difficulty, reward_money_multiplier,

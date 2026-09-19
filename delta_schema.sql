@@ -102,6 +102,8 @@ CREATE TABLE IF NOT EXISTS cache_quests (
 	quest_type INTEGER NOT NULL DEFAULT 0,
 	quest_package_id INTEGER NOT NULL DEFAULT 0,
 	content_tuning_id INTEGER NOT NULL DEFAULT 0,
+	quest_level INTEGER NOT NULL DEFAULT 0,
+	min_level INTEGER NOT NULL DEFAULT 0,
 	quest_sort_id INTEGER NOT NULL DEFAULT 0,
 	quest_info_id INTEGER NOT NULL DEFAULT 0,
 	suggested_group_num INTEGER NOT NULL DEFAULT 0,

@@ -47,7 +47,7 @@ const CREATURE_COLUMNS = [
 
 const QUEST_COLUMNS = [
 	'record_id', 'locale', 'content_hash', 'product', 'game_build',
-	'quest_type', 'quest_package_id', 'content_tuning_id', 'quest_sort_id',
+	'quest_type', 'quest_package_id', 'content_tuning_id', 'quest_level', 'min_level', 'quest_sort_id',
 	'quest_info_id', 'suggested_group_num', 'reward_next_quest',
 	'reward_xp_difficulty', 'reward_xp_multiplier',
 	'reward_money', 'reward_money_difficulty', 'reward_money_multiplier',
@@ -292,7 +292,7 @@ export class WdbDelta {
 				// the bit pattern intact. compute_hash sees the original value via stable_json
 				const entry_id = this.add_entity('cache_quests', QUEST_COLUMNS, record.id, hash, locale, product, [
 					record.id, locale, hash, product, game_build,
-					d.quest_type, d.quest_package_id, d.content_tuning_id, d.quest_sort_id,
+					d.quest_type, d.quest_package_id, d.content_tuning_id, d.quest_level ?? 0, d.quest_min_level ?? 0, d.quest_sort_id,
 					d.quest_info_id, d.suggested_group_num, d.reward_next_quest,
 					d.reward_xp_difficulty, d.reward_xp_multiplier,
 					d.reward_money, d.reward_money_difficulty, d.reward_money_multiplier,
