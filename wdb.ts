@@ -28,9 +28,6 @@ const CLASSIC_GOB_TRAILING_BUILD = 67156;
 // consumption on the 1.60.1 beta cache
 const FOREVER_LAYOUT_VERSION = { expansion: 12, major: 1, minor: 0 };
 
-// retail quest header gains quest_level/quest_min_level around quest_package_id; absent on 12.1.0
-// 69587, present from 12.1.7 70424 (earliest sampled)
-const RETAIL_QUEST_LEVELS_BUILD = 70424;
 
 type ProductFamily = 'retail' | 'classic';
 type LayoutFamily = ProductFamily | 'forever';
@@ -1030,17 +1027,26 @@ function read_conditional_quest_texts(buf: BufferReader, count: number): Conditi
 // 12.1 moved the objective and conditional-text blocks ahead of the bitpacked string lengths.
 // cache files routinely lag the submitted patch, so the version gate only picks which ordering to
 // try first; exact record consumption decides, and the other ordering is used as a fallback.
+// 12.1.7 adds quest_level/quest_min_level to the header (absent on 12.1.5 70575); builds interleave
+// across branches so the patch picks the preferred header and the same exact-consumption test decides
 function parse_quest(buf: BufferReader, length: number, ver: GameVersion): QuestRecord {
 	const start = buf.offset;
-	const layouts = ver_gte(ver, 12, 1, 0) ? [true, false] : [false, true];
+	const orderings = ver_gte(ver, 12, 1, 0) ? [true, false] : [false, true];
+	const level_headers = ver.family === 'forever' ? [false] : (ver_gte(ver, 12, 1, 7) ? [true, false] : [false, true]);
+
+	const layouts: { objectives_first: boolean; retail_levels: boolean }[] = [];
+	for (const retail_levels of level_headers) {
+		for (const objectives_first of orderings)
+			layouts.push({ objectives_first, retail_levels });
+	}
 
 	let candidate: QuestRecord | null = null;
 
-	for (const objectives_first of layouts) {
+	for (const { objectives_first, retail_levels } of layouts) {
 		buf.seek(start);
 
 		try {
-			const record = parse_quest_body(buf, length, ver, objectives_first);
+			const record = parse_quest_body(buf, length, ver, objectives_first, retail_levels);
 			if (buf.offset !== start + length)
 				continue;
 
@@ -1051,7 +1057,7 @@ function parse_quest(buf: BufferReader, length: number, ver: GameVersion): Quest
 
 			candidate ??= record;
 		} catch {
-			// layout mismatch, fall through and try the other ordering
+			// layout mismatch, fall through and try the next layout
 		}
 	}
 
@@ -1061,10 +1067,10 @@ function parse_quest(buf: BufferReader, length: number, ver: GameVersion): Quest
 	}
 
 	buf.seek(start);
-	return parse_quest_body(buf, length, ver, layouts[0]);
+	return parse_quest_body(buf, length, ver, layouts[0].objectives_first, layouts[0].retail_levels);
 }
 
-function parse_quest_body(buf: BufferReader, length: number, ver: GameVersion, objectives_first: boolean): QuestRecord {
+function parse_quest_body(buf: BufferReader, length: number, ver: GameVersion, objectives_first: boolean, retail_levels: boolean): QuestRecord {
 	const quest_id = buf.readUInt32LE();
 	const quest_type = buf.readUInt32LE();
 
@@ -1080,7 +1086,7 @@ function parse_quest_body(buf: BufferReader, length: number, ver: GameVersion, o
 		const quest_min_level = buf.readInt32LE();
 		quest_package_id = buf.readUInt32LE();
 		levels = { quest_level, quest_min_level };
-	} else if (ver.build >= RETAIL_QUEST_LEVELS_BUILD) {
+	} else if (retail_levels) {
 		const quest_level = buf.readInt32LE();
 		quest_package_id = buf.readUInt32LE();
 		const quest_min_level = buf.readInt32LE();
