@@ -28,6 +28,10 @@ const CLASSIC_GOB_TRAILING_BUILD = 67156;
 // consumption on the 1.60.1 beta cache
 const FOREVER_LAYOUT_VERSION = { expansion: 12, major: 1, minor: 0 };
 
+// retail quest header gains quest_level/quest_min_level around quest_package_id; absent on 12.1.0
+// 69587, present from 12.1.7 70424 (earliest sampled)
+const RETAIL_QUEST_LEVELS_BUILD = 70424;
+
 type ProductFamily = 'retail' | 'classic';
 type LayoutFamily = ProductFamily | 'forever';
 type ClassicQuestLayout = 'era' | 'anniversary' | 'wrath' | 'vanilla';
@@ -1066,7 +1070,7 @@ function parse_quest_body(buf: BufferReader, length: number, ver: GameVersion, o
 
 	// forever carries classic level words here and no content tuning id: quest_level, unk (0 in
 	// every sample), quest_min_level. verified on 1.60.1 build 69913 against vanilla values.
-	// the level fields stay absent on retail so its content hash keeps matching archavon
+	// the level fields stay absent on pre-12.1.7 retail so its content hash keeps matching archavon
 	let quest_package_id: number;
 	let content_tuning_id = 0;
 	let levels: { quest_level: number; quest_min_level: number } | null = null;
@@ -1075,6 +1079,12 @@ function parse_quest_body(buf: BufferReader, length: number, ver: GameVersion, o
 		buf.readUInt32LE();
 		const quest_min_level = buf.readInt32LE();
 		quest_package_id = buf.readUInt32LE();
+		levels = { quest_level, quest_min_level };
+	} else if (ver.build >= RETAIL_QUEST_LEVELS_BUILD) {
+		const quest_level = buf.readInt32LE();
+		quest_package_id = buf.readUInt32LE();
+		const quest_min_level = buf.readInt32LE();
+		content_tuning_id = buf.readUInt32LE();
 		levels = { quest_level, quest_min_level };
 	} else {
 		quest_package_id = buf.readUInt32LE();
